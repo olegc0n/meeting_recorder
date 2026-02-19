@@ -1,26 +1,42 @@
 """
 AI Meeting Transcriber - Main GUI Application
 """
+
 import sys
 from datetime import datetime
 from PySide6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QLabel, QComboBox, QPushButton, QTextEdit, QStatusBar, QMessageBox,
-    QSplitter, QGroupBox, QSpinBox, QDoubleSpinBox, QCheckBox, QFormLayout,
+    QApplication,
+    QMainWindow,
+    QWidget,
+    QVBoxLayout,
+    QHBoxLayout,
+    QLabel,
+    QComboBox,
+    QPushButton,
+    QTextEdit,
+    QStatusBar,
+    QMessageBox,
+    QSplitter,
+    QGroupBox,
+    QSpinBox,
+    QDoubleSpinBox,
+    QCheckBox,
+    QFormLayout,
 )
 from PySide6.QtCore import Qt
-from workers import AudioWorker, TranscriberWorker
+from workers import AudioWorker, TranscriberWorker, TranslationWorker
 from utils import get_output_devices, find_loopback_for_speaker
 from config import load_transcription_config, save_transcription_config
 
 
 class MeetingTranscriberWindow(QMainWindow):
     """Main window for the AI Meeting Transcriber application."""
-    
+
     def __init__(self):
         super().__init__()
         self.audio_worker: AudioWorker = None
         self.transcriber_worker: TranscriberWorker = None
+        self.translation_worker: TranslationWorker = None
         self.is_recording = False
         self.current_loopback_id = None
         self.stats_total = {"words": 0, "audio_s": 0, "latency_ms": 0, "chunk_count": 0}
@@ -28,48 +44,71 @@ class MeetingTranscriberWindow(QMainWindow):
         self.init_ui()
         self.load_devices()
         self.load_settings()
-    
+
     def init_ui(self):
         """Initialize the user interface."""
         self.setWindowTitle("AI Meeting Transcriber")
         self.setGeometry(100, 100, 1000, 650)
-        
+
         # Central widget
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
-        
+
         # Main layout
         main_layout = QVBoxLayout()
         central_widget.setLayout(main_layout)
-        
+
         # Audio Source Selection
         audio_label = QLabel("Select Audio Source (Speaker):")
         main_layout.addWidget(audio_label)
-        
+
         self.device_combo = QComboBox()
         self.device_combo.currentIndexChanged.connect(self.on_device_changed)
         main_layout.addWidget(self.device_combo)
-        
+
         # Language Selection
         language_label = QLabel("Select Language:")
         main_layout.addWidget(language_label)
-        
+
         self.language_combo = QComboBox()
         self.language_combo.addItems(["en", "es", "fr", "de", "ja", "auto"])
         self.language_combo.setCurrentText("en")
         main_layout.addWidget(self.language_combo)
-        
+
         # Horizontal splitter: Log (left) | Settings + Statistics (right)
         splitter = QSplitter(Qt.Horizontal)
 
         log_widget = QWidget()
         log_layout = QVBoxLayout(log_widget)
         log_layout.setContentsMargins(0, 0, 0, 0)
-        log_layout.addWidget(QLabel("Transcription Log:"))
+
+        # Vertical splitter for transcription and translation
+        log_splitter = QSplitter(Qt.Vertical)
+
+        # Transcription section
+        transcription_widget = QWidget()
+        transcription_layout = QVBoxLayout(transcription_widget)
+        transcription_layout.setContentsMargins(0, 0, 0, 0)
+        transcription_layout.addWidget(QLabel("Transcription Log:"))
         self.text_edit = QTextEdit()
         self.text_edit.setReadOnly(True)
         self.text_edit.setPlaceholderText("Transcribed text will appear here...")
-        log_layout.addWidget(self.text_edit)
+        transcription_layout.addWidget(self.text_edit)
+        log_splitter.addWidget(transcription_widget)
+
+        # Translation section
+        translation_widget = QWidget()
+        translation_layout = QVBoxLayout(translation_widget)
+        translation_layout.setContentsMargins(0, 0, 0, 0)
+        translation_layout.addWidget(QLabel("Translation (to English):"))
+        self.translation_edit = QTextEdit()
+        self.translation_edit.setReadOnly(True)
+        self.translation_edit.setPlaceholderText("Translations will appear here when source language is not English...")
+        translation_layout.addWidget(self.translation_edit)
+        log_splitter.addWidget(translation_widget)
+
+        log_splitter.setSizes([400, 200])
+        log_layout.addWidget(log_splitter)
         splitter.addWidget(log_widget)
 
         right_splitter = QSplitter(Qt.Vertical)
@@ -134,10 +173,10 @@ class MeetingTranscriberWindow(QMainWindow):
         splitter.addWidget(right_widget)
         splitter.setSizes([500, 280])
         main_layout.addWidget(splitter)
-        
+
         # Control Buttons
         button_layout = QHBoxLayout()
-        
+
         self.start_stop_btn = QPushButton("START RECORDING")
         self.start_stop_btn.setStyleSheet("""
             QPushButton {
@@ -153,7 +192,7 @@ class MeetingTranscriberWindow(QMainWindow):
         """)
         self.start_stop_btn.clicked.connect(self.toggle_recording)
         button_layout.addWidget(self.start_stop_btn)
-        
+
         self.clear_btn = QPushButton("CLEAR LOG")
         self.clear_btn.setStyleSheet("""
             QPushButton {
@@ -169,9 +208,25 @@ class MeetingTranscriberWindow(QMainWindow):
         """)
         self.clear_btn.clicked.connect(self.clear_log)
         button_layout.addWidget(self.clear_btn)
-        
+
+        self.clear_translation_btn = QPushButton("CLEAR TRANSLATION")
+        self.clear_translation_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #ff9800;
+                color: white;
+                font-weight: bold;
+                padding: 10px;
+                border-radius: 5px;
+            }
+            QPushButton:hover {
+                background-color: #e68900;
+            }
+        """)
+        self.clear_translation_btn.clicked.connect(self.clear_translation)
+        button_layout.addWidget(self.clear_translation_btn)
+
         main_layout.addLayout(button_layout)
-        
+
         # Status Bar
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
@@ -238,43 +293,49 @@ class MeetingTranscriberWindow(QMainWindow):
         self.latency_label.setText(f"{stats.get('latency_ms', 0):.0f} ms")
         n = self.stats_total["chunk_count"]
         if n > 0:
-            avg = (self.stats_total["latency_ms"] / 1000) / self.stats_total["audio_s"] if self.stats_total["audio_s"] > 0 else 0
+            avg = (
+                (self.stats_total["latency_ms"] / 1000) / self.stats_total["audio_s"]
+                if self.stats_total["audio_s"] > 0
+                else 0
+            )
             self.avg_rtf_label.setText(f"{avg:.3f}")
         self.total_words_label.setText(str(self.stats_total["words"]))
         self.chunks_label.setText(str(self.stats_total["chunk_count"]))
         self.model_load_label.setText(f"{stats.get('model_load_ms', 0):.0f} ms")
 
     def set_settings_enabled(self, enabled: bool):
-        for w in (self.model_combo, self.device_combo_settings, self.compute_combo,
-                  self.beam_spin, self.buffer_spin, self.vad_check):
+        for w in (
+            self.model_combo,
+            self.device_combo_settings,
+            self.compute_combo,
+            self.beam_spin,
+            self.buffer_spin,
+            self.vad_check,
+        ):
             w.setEnabled(enabled)
 
     def load_devices(self):
         """Load available output devices into the combo box."""
         self.device_combo.clear()
         devices = get_output_devices()
-        
+
         if not devices:
             self.device_combo.addItem("No devices found")
-            QMessageBox.warning(
-                self,
-                "No Devices",
-                "No audio output devices found. Please check your audio settings."
-            )
+            QMessageBox.warning(self, "No Devices", "No audio output devices found. Please check your audio settings.")
             return
-        
+
         for device in devices:
-            self.device_combo.addItem(device['name'], device['id'])
-    
+            self.device_combo.addItem(device["name"], device["id"])
+
     def on_device_changed(self, index: int):
         """Handle device selection change."""
         if index >= 0:
             device_id = self.device_combo.currentData()
             device_name = self.device_combo.currentText()
-            
+
             # Find corresponding loopback device
             loopback = find_loopback_for_speaker(device_name, device_id)
-            
+
             if loopback:
                 self.current_loopback_id = loopback[1]
                 self.status_bar.showMessage(f"Selected: {device_name} -> Loopback: {loopback[0]}")
@@ -284,27 +345,22 @@ class MeetingTranscriberWindow(QMainWindow):
                 QMessageBox.warning(
                     self,
                     "Loopback Not Found",
-                    f"Could not find a loopback microphone for '{device_name}'.\n"
-                    "Recording may not work correctly."
+                    f"Could not find a loopback microphone for '{device_name}'.\nRecording may not work correctly.",
                 )
-    
+
     def toggle_recording(self):
         """Start or stop recording."""
         if not self.is_recording:
             self.start_recording()
         else:
             self.stop_recording()
-    
+
     def start_recording(self):
         """Start audio recording and transcription."""
         if not self.current_loopback_id:
-            QMessageBox.warning(
-                self,
-                "No Device Selected",
-                "Please select an audio source first."
-            )
+            QMessageBox.warning(self, "No Device Selected", "Please select an audio source first.")
             return
-        
+
         try:
             language = self.language_combo.currentText()
             cfg = self.get_transcription_config()
@@ -329,8 +385,20 @@ class MeetingTranscriberWindow(QMainWindow):
             self.transcriber_worker.stats_updated.connect(self.on_stats_updated)
             self.transcriber_worker.start()
 
+            # Start translation worker if language is not English
+            language = self.language_combo.currentText()
+            if language not in ["en", "auto"]:
+                print("create translation")
+                self.translation_worker = TranslationWorker(source_language=language)
+                self.translation_worker.new_translation.connect(self.on_new_translation)
+                self.translation_worker.error_occurred.connect(self.on_translation_error)
+                self.translation_worker.status_update.connect(self.on_status_update)
+                self.translation_worker.start()
+            else:
+                self.translation_worker = None
+
             self.reset_stats()
-            
+
             # Update UI
             self.is_recording = True
             self.start_stop_btn.setText("STOP RECORDING")
@@ -350,23 +418,19 @@ class MeetingTranscriberWindow(QMainWindow):
             self.language_combo.setEnabled(False)
             self.set_settings_enabled(False)
             self.status_bar.showMessage("Recording...")
-            
+
             # Add start message to log
             timestamp = datetime.now().strftime("%H:%M:%S")
             self.append_to_log(f"[{timestamp}] Meeting started...")
-            
+
         except Exception as e:
-            QMessageBox.critical(
-                self,
-                "Recording Error",
-                f"Failed to start recording:\n{str(e)}"
-            )
+            QMessageBox.critical(self, "Recording Error", f"Failed to start recording:\n{str(e)}")
             self.stop_recording()
-    
+
     def stop_recording(self):
         """Stop audio recording and transcription."""
         self.is_recording = False
-        
+
         # Stop workers
         if self.audio_worker:
             self.audio_worker.stop()
@@ -374,14 +438,21 @@ class MeetingTranscriberWindow(QMainWindow):
             if self.audio_worker.isRunning():
                 self.audio_worker.terminate()
             self.audio_worker = None
-        
+
         if self.transcriber_worker:
             self.transcriber_worker.stop()
             self.transcriber_worker.wait(3000)  # Wait up to 3 seconds
             if self.transcriber_worker.isRunning():
                 self.transcriber_worker.terminate()
             self.transcriber_worker = None
-        
+
+        if self.translation_worker:
+            self.translation_worker.stop()
+            self.translation_worker.wait(3000)  # Wait up to 3 seconds
+            if self.translation_worker.isRunning():
+                self.translation_worker.terminate()
+            self.translation_worker = None
+
         # Update UI
         self.start_stop_btn.setText("START RECORDING")
         self.start_stop_btn.setStyleSheet("""
@@ -400,43 +471,64 @@ class MeetingTranscriberWindow(QMainWindow):
         self.language_combo.setEnabled(True)
         self.set_settings_enabled(True)
         self.status_bar.showMessage("Stopped")
-        
+
         # Add stop message to log
         timestamp = datetime.now().strftime("%H:%M:%S")
         self.append_to_log(f"[{timestamp}] Recording stopped.\n")
-    
+
     def on_new_transcription(self, text: str):
         """Handle new transcribed text."""
         self.append_to_log(text)
-    
+
+        # Send to translation worker if active
+        if self.translation_worker and self.translation_worker.isRunning():
+            self.translation_worker.add_text(text)
+
     def append_to_log(self, text: str):
         """Append text to the transcription log."""
         self.text_edit.append(text)
         # Auto-scroll to bottom
         scrollbar = self.text_edit.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())
-    
+
+    def on_new_translation(self, text: str):
+        """Handle new translated text."""
+        self.translation_edit.append(text)
+        # Auto-scroll to bottom
+        scrollbar = self.translation_edit.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
+
     def clear_log(self):
         """Clear the transcription log."""
         self.text_edit.clear()
-    
+
+    def clear_translation(self):
+        """Clear the translation log."""
+        self.translation_edit.clear()
+
     def on_status_update(self, status: str):
         """Handle status updates from workers."""
         if not self.is_recording:
             self.status_bar.showMessage(f"Ready ({status})")
         else:
             self.status_bar.showMessage(f"Recording... ({status})")
-    
+
     def on_audio_error(self, error_msg: str):
         """Handle audio worker errors."""
         QMessageBox.critical(self, "Audio Error", error_msg)
         self.stop_recording()
-    
+
     def on_transcription_error(self, error_msg: str):
         """Handle transcription worker errors."""
         QMessageBox.critical(self, "Transcription Error", error_msg)
         # Don't stop recording on transcription errors, just log them
-    
+
+    def on_translation_error(self, error_msg: str):
+        """Handle translation worker errors."""
+        # Log translation errors without stopping recording
+        print(f"Translation error: {error_msg}")
+        self.status_bar.showMessage(f"Translation error: {error_msg}")
+
     def closeEvent(self, event):
         """Handle window close event - ensure clean shutdown."""
         if self.is_recording:
@@ -447,13 +539,13 @@ class MeetingTranscriberWindow(QMainWindow):
 def main():
     """Main entry point."""
     app = QApplication(sys.argv)
-    
+
     # Set application style
     app.setStyle("Fusion")
-    
+
     window = MeetingTranscriberWindow()
     window.show()
-    
+
     sys.exit(app.exec())
 
 
