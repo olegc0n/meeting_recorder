@@ -21,6 +21,7 @@ def default_transcription_config() -> dict:
         "beam_size": 5,
         "buffer_duration": 3.0,
         "vad_filter": True,
+        "use_initial_prompt": True,
     }
 
 
@@ -34,6 +35,7 @@ def load_transcription_config() -> dict:
     cfg["beam_size"] = s.value("beam_size", cfg["beam_size"], type=int)
     cfg["buffer_duration"] = s.value("buffer_duration", cfg["buffer_duration"], type=float)
     cfg["vad_filter"] = s.value("vad_filter", cfg["vad_filter"], type=bool)
+    cfg["use_initial_prompt"] = s.value("use_initial_prompt", cfg["use_initial_prompt"], type=bool)
     return cfg
 
 

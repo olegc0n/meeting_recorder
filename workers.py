@@ -3,6 +3,7 @@ Worker threads for audio capture and transcription.
 """
 
 import time
+from datetime import datetime
 import soundcard as sc
 import numpy as np
 from queue import Queue, Empty
@@ -82,7 +83,7 @@ class TranscriberWorker(QThread):
     Reads audio chunks from a queue and emits transcribed text.
     """
 
-    new_text = Signal(str)
+    new_text = Signal(str, str, str, str)  # text, chunk_start, chunk_end, t_received
     status_update = Signal(str)
     error_occurred = Signal(str)
     stats_updated = Signal(dict)
@@ -97,6 +98,7 @@ class TranscriberWorker(QThread):
         beam_size: int = 5,
         buffer_duration: float = 3.0,
         vad_filter: bool = True,
+        use_initial_prompt: bool = True,
     ):
         super().__init__()
         self.audio_queue = audio_queue
@@ -107,12 +109,31 @@ class TranscriberWorker(QThread):
         self.beam_size = beam_size
         self.buffer_duration = buffer_duration
         self.vad_filter = vad_filter
+        self.use_initial_prompt = use_initial_prompt
         self.model: Optional[WhisperModel] = None
         self.running = False
 
         self.sample_rate = 16000
         self.buffer_samples = int(self.sample_rate * buffer_duration)
         self.audio_buffer = np.array([], dtype=np.float32)
+
+        # Rolling context fed back to Whisper as initial_prompt for better continuity
+        self.context_prompt: str = ""
+        self._max_prompt_words: int = 30
+
+        # Seconds of audio that were kept as overlap from the previous chunk.
+        # Segments whose end timestamp falls within this window are already
+        # transcribed and must be skipped.
+        self._overlap_s: float = 0.0
+
+        # Wall-clock time when the current audio chunk started accumulating
+        self._chunk_start_time: Optional[datetime] = None
+
+        # Silence-based early segmentation: trigger transcription when a pause
+        # is detected, rather than always waiting for the full buffer to fill.
+        self.silence_threshold: float = 0.01   # RMS energy below this = silence
+        self.silence_frames_s: float = 0.65    # seconds of silence required
+        self.min_audio_s: float = 1.5          # minimum NEW audio before silence trigger applies
 
     def run(self):
         """Main transcription loop."""
@@ -147,33 +168,93 @@ class TranscriberWorker(QThread):
                 try:
                     try:
                         chunk = self.audio_queue.get(timeout=0.1)
+                        if self._chunk_start_time is None:
+                            self._chunk_start_time = datetime.now()
                         self.audio_buffer = np.concatenate([self.audio_buffer, chunk])
                     except Empty:
                         continue
 
-                    if len(self.audio_buffer) >= self.buffer_samples:
+                    # --- Decide whether to transcribe now ---
+                    min_samples = int(self.sample_rate * self.min_audio_s)
+                    silence_samples = int(self.sample_rate * self.silence_frames_s)
+
+                    buffer_full = len(self.audio_buffer) >= self.buffer_samples
+
+                    # Only count *new* audio beyond the kept overlap toward the
+                    # minimum, so the overlap portion alone cannot immediately
+                    # re-trigger a silence-based transcription.
+                    overlap_samples_kept = int(self.sample_rate * self._overlap_s)
+                    new_samples_in_buffer = len(self.audio_buffer) - overlap_samples_kept
+
+                    silence_triggered = False
+                    if not buffer_full and new_samples_in_buffer >= min_samples:
+                        tail = (
+                            self.audio_buffer[-silence_samples:]
+                            if len(self.audio_buffer) >= silence_samples
+                            else self.audio_buffer
+                        )
+                        rms = float(np.sqrt(np.mean(tail ** 2)))
+                        silence_triggered = rms < self.silence_threshold
+
+                    if buffer_full or silence_triggered:
                         audio_to_transcribe = self.audio_buffer.copy()
-                        overlap_samples = int(self.sample_rate * 0.5)
-                        self.audio_buffer = self.audio_buffer[-overlap_samples:]
+                        chunk_start_time = self._chunk_start_time
+                        chunk_end_time = datetime.now()
+
+                        if buffer_full:
+                            # Keep a 1.0s overlap so boundary phrases aren't re-emitted
+                            overlap_samples = int(self.sample_rate * 1.0)
+                            self._overlap_s = overlap_samples / self.sample_rate
+                            self.audio_buffer = self.audio_buffer[-overlap_samples:]
+                            # Overlap carries over into next chunk — record its start now
+                            self._chunk_start_time = datetime.now()
+                        else:
+                            # Clean silence boundary — no overlap needed
+                            self._overlap_s = 0.0
+                            self.audio_buffer = np.array([], dtype=np.float32)
+                            self._chunk_start_time = None
 
                         audio_duration_s = len(audio_to_transcribe) / self.sample_rate
 
+                        t_sent = datetime.now()
                         t_start = time.perf_counter()
                         segments, info = self.model.transcribe(
                             audio_to_transcribe,
                             language=self.language,
                             beam_size=self.beam_size,
                             vad_filter=self.vad_filter,
+                            # Provide previous transcript as context so Whisper
+                            # can carry over vocabulary, style and proper nouns.
+                            initial_prompt=self.context_prompt or None if self.use_initial_prompt else None,
                         )
-                        t_end = time.perf_counter()
-                        transcribe_ms = (t_end - t_start) * 1000
 
+                        # Iterate the generator — actual decoding happens here
                         transcribed_text = ""
                         for segment in segments:
+                            # Skip segments that START within the overlap window;
+                            # their audio was already transcribed in the previous
+                            # chunk. Using segment.start (not segment.end) avoids
+                            # passing through segments that merely overlap the
+                            # boundary, which caused phrase duplication.
+                            if segment.start < self._overlap_s:
+                                continue
                             transcribed_text += segment.text.strip() + " "
 
+                        t_end = time.perf_counter()
+                        t_received = datetime.now()
+                        transcribe_ms = (t_end - t_start) * 1000
+
                         if transcribed_text.strip():
-                            self.new_text.emit(transcribed_text.strip())
+                            # Update rolling context (keep last N words)
+                            combined = (self.context_prompt + " " + transcribed_text).split()
+                            self.context_prompt = " ".join(combined[-self._max_prompt_words:])
+
+                            self.new_text.emit(
+                                transcribed_text.strip(),
+                                chunk_start_time.strftime("%H:%M:%S.%f")[:-3] if chunk_start_time else "",
+                                chunk_end_time.strftime("%H:%M:%S.%f")[:-3],
+                                t_received.strftime("%H:%M:%S.%f")[:-3],
+                            )
 
                             word_count = len(transcribed_text.split())
                             rtf = transcribe_ms / 1000 / audio_duration_s if audio_duration_s > 0 else 0
@@ -214,6 +295,7 @@ class TranscriberWorker(QThread):
                     language=self.language,
                     beam_size=self.beam_size,
                     vad_filter=self.vad_filter,
+                    initial_prompt=self.context_prompt or None if self.use_initial_prompt else None,
                 )
                 transcribed_text = ""
                 for segment in segments:
@@ -224,10 +306,16 @@ class TranscriberWorker(QThread):
                 print(f"Error transcribing final buffer: {e}")
 
         self.audio_buffer = np.array([], dtype=np.float32)
+        self.context_prompt = ""
+        self._overlap_s = 0.0
+        self._chunk_start_time = None
 
     def set_language(self, language: str):
         """Update the language setting."""
         self.language = language if language != "auto" else None
+        self.context_prompt = ""  # reset context when language changes
+        self._overlap_s = 0.0
+        self._chunk_start_time = None
 
 
 class TranslationWorker(QThread):

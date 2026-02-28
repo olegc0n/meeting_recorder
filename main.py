@@ -142,6 +142,10 @@ class MeetingTranscriberWindow(QMainWindow):
         self.vad_check.setChecked(True)
         self.vad_check.setToolTip("Off = faster, more noise")
         settings_layout.addRow("", self.vad_check)
+        self.initial_prompt_check = QCheckBox("Enable initial prompt")
+        self.initial_prompt_check.setChecked(True)
+        self.initial_prompt_check.setToolTip("Feed previous transcript as context to improve continuity")
+        settings_layout.addRow("", self.initial_prompt_check)
         right_splitter.addWidget(settings_group)
 
         stats_group = QGroupBox("Statistics")
@@ -238,6 +242,7 @@ class MeetingTranscriberWindow(QMainWindow):
         self.beam_spin.valueChanged.connect(self.save_settings)
         self.buffer_spin.valueChanged.connect(self.save_settings)
         self.vad_check.toggled.connect(self.save_settings)
+        self.initial_prompt_check.toggled.connect(self.save_settings)
 
     def load_settings(self):
         cfg = load_transcription_config()
@@ -247,18 +252,21 @@ class MeetingTranscriberWindow(QMainWindow):
         self.beam_spin.blockSignals(True)
         self.buffer_spin.blockSignals(True)
         self.vad_check.blockSignals(True)
+        self.initial_prompt_check.blockSignals(True)
         self.model_combo.setCurrentText(cfg["model_size"])
         self.device_combo_settings.setCurrentText(cfg["device"])
         self.compute_combo.setCurrentText(cfg["compute_type"])
         self.beam_spin.setValue(cfg["beam_size"])
         self.buffer_spin.setValue(cfg["buffer_duration"])
         self.vad_check.setChecked(cfg["vad_filter"])
+        self.initial_prompt_check.setChecked(cfg["use_initial_prompt"])
         self.model_combo.blockSignals(False)
         self.device_combo_settings.blockSignals(False)
         self.compute_combo.blockSignals(False)
         self.beam_spin.blockSignals(False)
         self.buffer_spin.blockSignals(False)
         self.vad_check.blockSignals(False)
+        self.initial_prompt_check.blockSignals(False)
 
     def save_settings(self):
         save_transcription_config(self.get_transcription_config())
@@ -271,6 +279,7 @@ class MeetingTranscriberWindow(QMainWindow):
             "beam_size": self.beam_spin.value(),
             "buffer_duration": self.buffer_spin.value(),
             "vad_filter": self.vad_check.isChecked(),
+            "use_initial_prompt": self.initial_prompt_check.isChecked(),
         }
 
     def reset_stats(self):
@@ -311,6 +320,7 @@ class MeetingTranscriberWindow(QMainWindow):
             self.beam_spin,
             self.buffer_spin,
             self.vad_check,
+            self.initial_prompt_check,
         ):
             w.setEnabled(enabled)
 
@@ -378,6 +388,7 @@ class MeetingTranscriberWindow(QMainWindow):
                 beam_size=cfg["beam_size"],
                 buffer_duration=cfg["buffer_duration"],
                 vad_filter=cfg["vad_filter"],
+                use_initial_prompt=cfg["use_initial_prompt"],
             )
             self.transcriber_worker.new_text.connect(self.on_new_transcription)
             self.transcriber_worker.status_update.connect(self.on_status_update)
@@ -476,17 +487,20 @@ class MeetingTranscriberWindow(QMainWindow):
         timestamp = datetime.now().strftime("%H:%M:%S")
         self.append_to_log(f"[{timestamp}] Recording stopped.\n")
 
-    def on_new_transcription(self, text: str):
+    def on_new_transcription(self, text: str, chunk_start: str, chunk_end: str, t_received: str):
         """Handle new transcribed text."""
-        self.append_to_log(text)
+        self.append_to_log(text, chunk_start, chunk_end, t_received)
 
         # Send to translation worker if active
         if self.translation_worker and self.translation_worker.isRunning():
             self.translation_worker.add_text(text)
 
-    def append_to_log(self, text: str):
-        """Append text to the transcription log."""
-        self.text_edit.append(text)
+    def append_to_log(self, text: str, chunk_start: str = "", chunk_end: str = "", t_received: str = ""):
+        """Append text to the transcription log with audio chunk and whisper timestamps."""
+        if chunk_start and chunk_end and t_received:
+            self.text_edit.append(f"[{chunk_start} - {chunk_end}][{t_received}] {text}")
+        else:
+            self.text_edit.append(text)
         # Auto-scroll to bottom
         scrollbar = self.text_edit.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())
