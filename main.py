@@ -1,5 +1,5 @@
 """
-AI Meeting Transcriber - Main GUI Application
+AI Meeting Transcriber - Main GUI Application (Modern UI)
 """
 
 import sys
@@ -17,18 +17,220 @@ from PySide6.QtWidgets import (
     QStatusBar,
     QMessageBox,
     QSplitter,
-    QGroupBox,
-    QSpinBox,
-    QDoubleSpinBox,
-    QCheckBox,
-    QFormLayout,
+    QFrame,
+    QSizePolicy,
 )
-from PySide6.QtCore import Qt
-from workers import AudioWorker, TranscriberWorker, TranslationWorker
+from PySide6.QtCore import Qt, QSize
+from PySide6.QtGui import QFont, QIcon, QColor
+
+from workers import AudioWorker, TranscriberWorker, TranslationWorker, LLMAnalysisWorker
 from utils import get_output_devices, find_loopback_for_speaker
-from config import load_transcription_config, save_transcription_config
+from config import load_transcription_config, save_transcription_config, load_audio_source, save_audio_source
+from settings_dialog import SettingsDialog
+from stats_panel import StatsPanel
+
+# ---------------------------------------------------------------------------
+#  Global application stylesheet - Catppuccin Mocha-inspired dark theme
+# ---------------------------------------------------------------------------
+APP_STYLESHEET = """
+/* ---- Base ---- */
+QMainWindow {
+    background-color: #181825;
+}
+QWidget {
+    font-family: "Segoe UI", "Noto Sans", "Cantarell", sans-serif;
+}
+QStatusBar {
+    background-color: #11111b;
+    color: #a6adc8;
+    font-size: 12px;
+    border-top: 1px solid #313244;
+    padding: 2px 8px;
+}
+
+/* ---- Cards (QFrame#card) ---- */
+QFrame#card {
+    background-color: #1e1e2e;
+    border: 1px solid #313244;
+    border-radius: 12px;
+}
+
+/* ---- Labels ---- */
+QLabel {
+    color: #cdd6f4;
+}
+QLabel#headerTitle {
+    font-size: 20px;
+    font-weight: 700;
+    color: #cdd6f4;
+}
+QLabel#headerSubtitle {
+    font-size: 12px;
+    color: #a6adc8;
+}
+QLabel#cardTitle {
+    font-size: 13px;
+    font-weight: 600;
+    color: #89b4fa;
+}
+QLabel#selectorLabel {
+    font-size: 12px;
+    color: #a6adc8;
+    font-weight: 500;
+}
+
+/* ---- Combo boxes ---- */
+QComboBox {
+    background-color: #313244;
+    color: #cdd6f4;
+    border: 1px solid #45475a;
+    border-radius: 8px;
+    padding: 6px 12px;
+    min-height: 28px;
+    font-size: 13px;
+}
+QComboBox:hover {
+    border-color: #89b4fa;
+}
+QComboBox:disabled {
+    background-color: #1e1e2e;
+    color: #585b70;
+    border-color: #313244;
+}
+QComboBox::drop-down {
+    border: none;
+    padding-right: 8px;
+}
+QComboBox::down-arrow {
+    image: none;
+    border-left: 5px solid transparent;
+    border-right: 5px solid transparent;
+    border-top: 6px solid #89b4fa;
+    margin-right: 8px;
+}
+QComboBox QAbstractItemView {
+    background-color: #313244;
+    color: #cdd6f4;
+    border: 1px solid #45475a;
+    border-radius: 8px;
+    selection-background-color: #45475a;
+    padding: 4px;
+}
+
+/* ---- TextEdits ---- */
+QTextEdit {
+    background-color: #11111b;
+    color: #cdd6f4;
+    border: none;
+    border-radius: 8px;
+    padding: 10px;
+    font-size: 13px;
+    selection-background-color: #45475a;
+    selection-color: #cdd6f4;
+}
+QTextEdit[readOnly="true"] {
+    background-color: #11111b;
+}
+
+/* ---- Scrollbars ---- */
+QScrollBar:vertical {
+    background: transparent;
+    width: 8px;
+    margin: 0;
+}
+QScrollBar::handle:vertical {
+    background: #45475a;
+    border-radius: 4px;
+    min-height: 30px;
+}
+QScrollBar::handle:vertical:hover {
+    background: #585b70;
+}
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+    height: 0;
+}
+QScrollBar:horizontal {
+    background: transparent;
+    height: 8px;
+}
+QScrollBar::handle:horizontal {
+    background: #45475a;
+    border-radius: 4px;
+}
+
+/* ---- Splitter ---- */
+QSplitter::handle {
+    background-color: #313244;
+}
+QSplitter::handle:horizontal {
+    width: 2px;
+}
+QSplitter::handle:vertical {
+    height: 2px;
+}
+"""
 
 
+# ---------------------------------------------------------------------------
+#  Helper - icon-style toolbar button
+# ---------------------------------------------------------------------------
+def _icon_button(text: str, tooltip: str, size: int = 36) -> QPushButton:
+    btn = QPushButton(text)
+    btn.setToolTip(tooltip)
+    btn.setFixedSize(size, size)
+    btn.setCursor(Qt.PointingHandCursor)
+    btn.setStyleSheet(f"""
+        QPushButton {{
+            background-color: #313244;
+            color: #cdd6f4;
+            border: none;
+            border-radius: {size // 2}px;
+            font-size: 16px;
+        }}
+        QPushButton:hover {{
+            background-color: #45475a;
+        }}
+        QPushButton:disabled {{
+            background-color: #1e1e2e;
+            color: #585b70;
+        }}
+    """)
+    return btn
+
+
+def _action_button(text: str, color: str, hover: str, text_color: str = "#ffffff") -> QPushButton:
+    btn = QPushButton(text)
+    btn.setCursor(Qt.PointingHandCursor)
+    btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+    btn.setStyleSheet(f"""
+        QPushButton {{
+            background-color: {color};
+            color: {text_color};
+            font-weight: 600;
+            font-size: 13px;
+            padding: 10px 0;
+            border: none;
+            border-radius: 8px;
+        }}
+        QPushButton:hover {{
+            background-color: {hover};
+        }}
+    """)
+    return btn
+
+
+def _card(inner_layout=None) -> QFrame:
+    """Wrap *inner_layout* in a rounded card frame."""
+    frame = QFrame()
+    frame.setObjectName("card")
+    if inner_layout is not None:
+        frame.setLayout(inner_layout)
+    return frame
+
+
+# =========================================================================
+#  Main Window
+# =========================================================================
 class MeetingTranscriberWindow(QMainWindow):
     """Main window for the AI Meeting Transcriber application."""
 
@@ -37,346 +239,340 @@ class MeetingTranscriberWindow(QMainWindow):
         self.audio_worker: AudioWorker = None
         self.transcriber_worker: TranscriberWorker = None
         self.translation_worker: TranslationWorker = None
+        self.llm_worker: LLMAnalysisWorker = None
         self.is_recording = False
         self.current_loopback_id = None
         self.stats_total = {"words": 0, "audio_s": 0, "latency_ms": 0, "chunk_count": 0}
 
-        self.init_ui()
-        self.load_devices()
-        self.load_settings()
+        self._current_config = load_transcription_config()
 
-    def init_ui(self):
-        """Initialize the user interface."""
+        self._init_ui()
+        self._load_devices()
+
+    # ------------------------------------------------------------------
+    #  UI Construction
+    # ------------------------------------------------------------------
+    def _init_ui(self):
         self.setWindowTitle("AI Meeting Transcriber")
-        self.setGeometry(100, 100, 1000, 650)
+        self.setMinimumSize(960, 620)
+        self.resize(1080, 700)
 
-        # Central widget
-        central_widget = QWidget()
-        self.setCentralWidget(central_widget)
+        # Central widget & root layout
+        root = QWidget()
+        self.setCentralWidget(root)
+        root_layout = QVBoxLayout(root)
+        root_layout.setContentsMargins(12, 12, 12, 8)
+        root_layout.setSpacing(10)
 
-        # Main layout
-        main_layout = QVBoxLayout()
-        central_widget.setLayout(main_layout)
+        # ---- Top bar ----
+        root_layout.addLayout(self._build_top_bar())
 
-        # Audio Source Selection
-        audio_label = QLabel("Select Audio Source (Speaker):")
-        main_layout.addWidget(audio_label)
+        # ---- Selector row (device + language) ----
+        root_layout.addLayout(self._build_selector_row())
+
+        # ---- Main content area (splitter) ----
+        root_layout.addWidget(self._build_content_area(), stretch=1)
+
+        # ---- Bottom action buttons ----
+        root_layout.addLayout(self._build_action_buttons())
+
+        # ---- Status bar ----
+        self.status_bar = QStatusBar()
+        self.setStatusBar(self.status_bar)
+        self.status_bar.showMessage("Ready - model not loaded")
+
+        # ---- Stats slide-out panel (lives inside central widget) ----
+        self.stats_panel = StatsPanel(root)
+        self.stats_panel.reposition()
+
+    # ........................ top bar ........................
+    def _build_top_bar(self) -> QHBoxLayout:
+        bar = QHBoxLayout()
+        bar.setContentsMargins(4, 0, 4, 0)
+
+        # Branding
+        title = QLabel("AI Meeting Transcriber")
+        title.setObjectName("headerTitle")
+        bar.addWidget(title)
+
+        bar.addStretch()
+
+        # Stats toggle
+        self.stats_btn = _icon_button("\U0001F4CA", "Toggle statistics panel")
+        self.stats_btn.clicked.connect(self._toggle_stats)
+        bar.addWidget(self.stats_btn)
+
+        # Settings gear
+        self.settings_btn = _icon_button("\u2699", "Open settings")
+        self.settings_btn.clicked.connect(self._open_settings)
+        bar.addWidget(self.settings_btn)
+
+        return bar
+
+    # ........................ selectors ........................
+    def _build_selector_row(self) -> QHBoxLayout:
+        row = QHBoxLayout()
+        row.setSpacing(12)
+
+        # Audio source
+        src_lbl = QLabel("Audio Source")
+        src_lbl.setObjectName("selectorLabel")
+        row.addWidget(src_lbl)
 
         self.device_combo = QComboBox()
-        self.device_combo.currentIndexChanged.connect(self.on_device_changed)
-        main_layout.addWidget(self.device_combo)
+        self.device_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.device_combo.currentIndexChanged.connect(self._on_device_changed)
+        row.addWidget(self.device_combo, stretch=3)
 
-        # Language Selection
-        language_label = QLabel("Select Language:")
-        main_layout.addWidget(language_label)
+        row.addSpacing(16)
+
+        # Language
+        lang_lbl = QLabel("Language")
+        lang_lbl.setObjectName("selectorLabel")
+        row.addWidget(lang_lbl)
 
         self.language_combo = QComboBox()
         self.language_combo.addItems(["en", "es", "fr", "de", "ja", "auto"])
         self.language_combo.setCurrentText("en")
-        main_layout.addWidget(self.language_combo)
+        self.language_combo.setFixedWidth(100)
+        row.addWidget(self.language_combo)
 
-        # Horizontal splitter: Log (left) | Settings + Statistics (right)
-        splitter = QSplitter(Qt.Horizontal)
+        return row
 
-        log_widget = QWidget()
-        log_layout = QVBoxLayout(log_widget)
-        log_layout.setContentsMargins(0, 0, 0, 0)
+    # ........................ content area ........................
+    def _build_content_area(self) -> QSplitter:
+        # Outer horizontal splitter: left (transcription/translation) | right (LLM)
+        self.hsplitter = QSplitter(Qt.Horizontal)
 
-        # Vertical splitter for transcription and translation
-        log_splitter = QSplitter(Qt.Vertical)
+        # -- LEFT: vertical splitter for transcription + translation --
+        left_splitter = QSplitter(Qt.Vertical)
 
-        # Transcription section
-        transcription_widget = QWidget()
-        transcription_layout = QVBoxLayout(transcription_widget)
-        transcription_layout.setContentsMargins(0, 0, 0, 0)
-        transcription_layout.addWidget(QLabel("Transcription Log:"))
+        # Transcription card
+        t_layout = QVBoxLayout()
+        t_layout.setContentsMargins(14, 10, 14, 10)
+        t_layout.setSpacing(6)
+        t_header = QLabel("Transcription")
+        t_header.setObjectName("cardTitle")
+        t_layout.addWidget(t_header)
         self.text_edit = QTextEdit()
         self.text_edit.setReadOnly(True)
         self.text_edit.setPlaceholderText("Transcribed text will appear here...")
-        transcription_layout.addWidget(self.text_edit)
-        log_splitter.addWidget(transcription_widget)
+        t_layout.addWidget(self.text_edit)
+        left_splitter.addWidget(_card(t_layout))
 
-        # Translation section
-        translation_widget = QWidget()
-        translation_layout = QVBoxLayout(translation_widget)
-        translation_layout.setContentsMargins(0, 0, 0, 0)
-        translation_layout.addWidget(QLabel("Translation (to English):"))
+        # Translation card
+        tr_layout = QVBoxLayout()
+        tr_layout.setContentsMargins(14, 10, 14, 10)
+        tr_layout.setSpacing(6)
+        tr_header = QLabel("Translation (to English)")
+        tr_header.setObjectName("cardTitle")
+        tr_layout.addWidget(tr_header)
         self.translation_edit = QTextEdit()
         self.translation_edit.setReadOnly(True)
-        self.translation_edit.setPlaceholderText("Translations will appear here when source language is not English...")
-        translation_layout.addWidget(self.translation_edit)
-        log_splitter.addWidget(translation_widget)
+        self.translation_edit.setPlaceholderText("Translations appear when source language is not English...")
+        tr_layout.addWidget(self.translation_edit)
+        left_splitter.addWidget(_card(tr_layout))
 
-        log_splitter.setSizes([400, 200])
-        log_layout.addWidget(log_splitter)
-        splitter.addWidget(log_widget)
+        left_splitter.setSizes([420, 180])
+        self.hsplitter.addWidget(left_splitter)
 
-        right_splitter = QSplitter(Qt.Vertical)
-        settings_group = QGroupBox("Settings")
-        settings_layout = QFormLayout(settings_group)
-        self.model_combo = QComboBox()
-        self.model_combo.addItems(["tiny", "base", "small", "medium"])
-        self.model_combo.setToolTip("Larger = better accuracy, slower")
-        settings_layout.addRow("Model:", self.model_combo)
-        self.device_combo_settings = QComboBox()
-        self.device_combo_settings.addItems(["cpu", "cuda", "auto"])
-        self.device_combo_settings.setToolTip("cuda requires GPU")
-        settings_layout.addRow("Device:", self.device_combo_settings)
-        self.compute_combo = QComboBox()
-        self.compute_combo.addItems(["int8", "float16", "float32"])
-        self.compute_combo.setToolTip("int8 for CPU, float16 for GPU")
-        settings_layout.addRow("Compute:", self.compute_combo)
-        self.beam_spin = QSpinBox()
-        self.beam_spin.setRange(1, 10)
-        self.beam_spin.setValue(5)
-        self.beam_spin.setToolTip("1=fastest, 5-7=balanced")
-        settings_layout.addRow("Beam size:", self.beam_spin)
-        self.buffer_spin = QDoubleSpinBox()
-        self.buffer_spin.setRange(1.0, 5.0)
-        self.buffer_spin.setSingleStep(0.5)
-        self.buffer_spin.setValue(3.0)
-        self.buffer_spin.setSuffix(" s")
-        self.buffer_spin.setToolTip("Shorter = lower latency")
-        settings_layout.addRow("Buffer:", self.buffer_spin)
-        self.vad_check = QCheckBox("Enable VAD filter")
-        self.vad_check.setChecked(True)
-        self.vad_check.setToolTip("Off = faster, more noise")
-        settings_layout.addRow("", self.vad_check)
-        self.initial_prompt_check = QCheckBox("Enable initial prompt")
-        self.initial_prompt_check.setChecked(True)
-        self.initial_prompt_check.setToolTip("Feed previous transcript as context to improve continuity")
-        settings_layout.addRow("", self.initial_prompt_check)
-        right_splitter.addWidget(settings_group)
+        # -- RIGHT: LLM analysis card --
+        a_layout = QVBoxLayout()
+        a_layout.setContentsMargins(14, 10, 14, 10)
+        a_layout.setSpacing(6)
+        a_header = QLabel("LLM Meeting Analysis")
+        a_header.setObjectName("cardTitle")
+        a_layout.addWidget(a_header)
+        self.analysis_edit = QTextEdit()
+        self.analysis_edit.setReadOnly(True)
+        self.analysis_edit.setPlaceholderText("AI-generated key points will appear here...")
+        a_layout.addWidget(self.analysis_edit)
+        self.hsplitter.addWidget(_card(a_layout))
 
-        stats_group = QGroupBox("Statistics")
-        stats_layout = QFormLayout(stats_group)
-        self.rtf_label = QLabel("—")
-        self.rtf_label.setToolTip(self.tr("real-time factor for the last chunk (< 1 = faster than real-time)"))
-        self.wps_label = QLabel("—")
-        self.wps_label.setToolTip(self.tr("words per second for the last chunk"))
-        self.latency_label = QLabel("—")
-        self.latency_label.setToolTip(self.tr("ms to transcribe last chunk"))
-        self.avg_rtf_label = QLabel("—")
-        self.total_words_label = QLabel("—")
-        self.chunks_label = QLabel("—")
-        self.model_load_label = QLabel("—")
-        stats_layout.addRow("RTF (last):", self.rtf_label)
-        stats_layout.addRow("WPS (last):", self.wps_label)
-        stats_layout.addRow("Latency (last):", self.latency_label)
-        stats_layout.addRow("Avg RTF:", self.avg_rtf_label)
-        stats_layout.addRow("Total words:", self.total_words_label)
-        stats_layout.addRow("Chunks:", self.chunks_label)
-        stats_layout.addRow("Model load:", self.model_load_label)
-        right_splitter.addWidget(stats_group)
-        right_splitter.setSizes([200, 200])
+        self.hsplitter.setSizes([520, 440])
+        return self.hsplitter
 
-        right_widget = QWidget()
-        right_layout = QVBoxLayout(right_widget)
-        right_layout.setContentsMargins(0, 0, 0, 0)
-        right_layout.addWidget(right_splitter)
-        splitter.addWidget(right_widget)
-        splitter.setSizes([500, 280])
-        main_layout.addWidget(splitter)
+    # ........................ action buttons ........................
+    def _build_action_buttons(self) -> QHBoxLayout:
+        row = QHBoxLayout()
+        row.setSpacing(10)
 
-        # Control Buttons
-        button_layout = QHBoxLayout()
+        self.start_stop_btn = _action_button(
+            "\u25CF  START RECORDING", "#a6e3a1", "#94e2d5", "#1e1e2e"
+        )
+        self.start_stop_btn.setStyleSheet(self._rec_btn_style(recording=False))
+        self.start_stop_btn.clicked.connect(self._toggle_recording)
+        row.addWidget(self.start_stop_btn)
 
-        self.start_stop_btn = QPushButton("START RECORDING")
-        self.start_stop_btn.setStyleSheet("""
+        self.clear_btn = _action_button("Clear Log", "#313244", "#45475a", "#cdd6f4")
+        self.clear_btn.clicked.connect(self._clear_log)
+        row.addWidget(self.clear_btn)
+
+        self.clear_translation_btn = _action_button(
+            "Clear Translation", "#313244", "#45475a", "#cdd6f4"
+        )
+        self.clear_translation_btn.clicked.connect(self._clear_translation)
+        row.addWidget(self.clear_translation_btn)
+
+        self.clear_analysis_btn = _action_button(
+            "Clear Analysis", "#313244", "#45475a", "#cdd6f4"
+        )
+        self.clear_analysis_btn.clicked.connect(self._clear_analysis)
+        row.addWidget(self.clear_analysis_btn)
+
+        return row
+
+    # ------------------------------------------------------------------
+    #  Styling helpers
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _rec_btn_style(recording: bool) -> str:
+        if recording:
+            return """
+                QPushButton {
+                    background-color: #f38ba8;
+                    color: #1e1e2e;
+                    font-weight: 700;
+                    font-size: 13px;
+                    padding: 10px 0;
+                    border: none;
+                    border-radius: 8px;
+                }
+                QPushButton:hover {
+                    background-color: #eba0ac;
+                }
+            """
+        return """
             QPushButton {
-                background-color: #4CAF50;
-                color: white;
-                font-weight: bold;
-                padding: 10px;
-                border-radius: 5px;
+                background-color: #a6e3a1;
+                color: #1e1e2e;
+                font-weight: 700;
+                font-size: 13px;
+                padding: 10px 0;
+                border: none;
+                border-radius: 8px;
             }
             QPushButton:hover {
-                background-color: #45a049;
+                background-color: #94e2d5;
             }
-        """)
-        self.start_stop_btn.clicked.connect(self.toggle_recording)
-        button_layout.addWidget(self.start_stop_btn)
+        """
 
-        self.clear_btn = QPushButton("CLEAR LOG")
-        self.clear_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #f44336;
-                color: white;
-                font-weight: bold;
-                padding: 10px;
-                border-radius: 5px;
-            }
-            QPushButton:hover {
-                background-color: #da190b;
-            }
-        """)
-        self.clear_btn.clicked.connect(self.clear_log)
-        button_layout.addWidget(self.clear_btn)
+    # ------------------------------------------------------------------
+    #  Settings dialog
+    # ------------------------------------------------------------------
+    def _open_settings(self):
+        dlg = SettingsDialog(self._current_config, self)
+        dlg.settings_changed.connect(self._apply_settings)
+        dlg.exec()
 
-        self.clear_translation_btn = QPushButton("CLEAR TRANSLATION")
-        self.clear_translation_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #ff9800;
-                color: white;
-                font-weight: bold;
-                padding: 10px;
-                border-radius: 5px;
-            }
-            QPushButton:hover {
-                background-color: #e68900;
-            }
-        """)
-        self.clear_translation_btn.clicked.connect(self.clear_translation)
-        button_layout.addWidget(self.clear_translation_btn)
+    def _apply_settings(self, cfg: dict):
+        self._current_config = cfg
+        save_transcription_config(cfg)
 
-        main_layout.addLayout(button_layout)
+    # ------------------------------------------------------------------
+    #  Statistics panel
+    # ------------------------------------------------------------------
+    def _toggle_stats(self):
+        self.stats_panel.toggle()
 
-        # Status Bar
-        self.status_bar = QStatusBar()
-        self.setStatusBar(self.status_bar)
-        self.status_bar.showMessage("Ready (Model not loaded)")
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, "stats_panel"):
+            self.stats_panel.reposition()
 
-        self.model_combo.currentTextChanged.connect(self.save_settings)
-        self.device_combo_settings.currentTextChanged.connect(self.save_settings)
-        self.compute_combo.currentTextChanged.connect(self.save_settings)
-        self.beam_spin.valueChanged.connect(self.save_settings)
-        self.buffer_spin.valueChanged.connect(self.save_settings)
-        self.vad_check.toggled.connect(self.save_settings)
-        self.initial_prompt_check.toggled.connect(self.save_settings)
-
-    def load_settings(self):
-        cfg = load_transcription_config()
-        self.model_combo.blockSignals(True)
-        self.device_combo_settings.blockSignals(True)
-        self.compute_combo.blockSignals(True)
-        self.beam_spin.blockSignals(True)
-        self.buffer_spin.blockSignals(True)
-        self.vad_check.blockSignals(True)
-        self.initial_prompt_check.blockSignals(True)
-        self.model_combo.setCurrentText(cfg["model_size"])
-        self.device_combo_settings.setCurrentText(cfg["device"])
-        self.compute_combo.setCurrentText(cfg["compute_type"])
-        self.beam_spin.setValue(cfg["beam_size"])
-        self.buffer_spin.setValue(cfg["buffer_duration"])
-        self.vad_check.setChecked(cfg["vad_filter"])
-        self.initial_prompt_check.setChecked(cfg["use_initial_prompt"])
-        self.model_combo.blockSignals(False)
-        self.device_combo_settings.blockSignals(False)
-        self.compute_combo.blockSignals(False)
-        self.beam_spin.blockSignals(False)
-        self.buffer_spin.blockSignals(False)
-        self.vad_check.blockSignals(False)
-        self.initial_prompt_check.blockSignals(False)
-
-    def save_settings(self):
-        save_transcription_config(self.get_transcription_config())
-
-    def get_transcription_config(self) -> dict:
-        return {
-            "model_size": self.model_combo.currentText(),
-            "device": self.device_combo_settings.currentText(),
-            "compute_type": self.compute_combo.currentText(),
-            "beam_size": self.beam_spin.value(),
-            "buffer_duration": self.buffer_spin.value(),
-            "vad_filter": self.vad_check.isChecked(),
-            "use_initial_prompt": self.initial_prompt_check.isChecked(),
-        }
-
-    def reset_stats(self):
+    def _reset_stats(self):
         self.stats_total = {"words": 0, "audio_s": 0, "latency_ms": 0, "chunk_count": 0}
-        self.rtf_label.setText("—")
-        self.wps_label.setText("—")
-        self.latency_label.setText("—")
-        self.avg_rtf_label.setText("—")
-        self.total_words_label.setText("—")
-        self.chunks_label.setText("—")
-        self.model_load_label.setText("—")
+        self.stats_panel.reset()
 
-    def on_stats_updated(self, stats: dict):
+    def _on_stats_updated(self, stats: dict):
         self.stats_total["words"] += stats.get("words", 0)
         self.stats_total["audio_s"] += stats.get("audio_s", 0)
         self.stats_total["latency_ms"] += stats.get("latency_ms", 0)
         self.stats_total["chunk_count"] += stats.get("chunk_count", 0)
-        self.rtf_label.setText(f"{stats.get('rtf', 0):.3f}")
-        self.wps_label.setText(f"{stats.get('wps', 0):.1f}")
-        self.latency_label.setText(f"{stats.get('latency_ms', 0):.0f} ms")
+
         n = self.stats_total["chunk_count"]
-        if n > 0:
-            avg = (
-                (self.stats_total["latency_ms"] / 1000) / self.stats_total["audio_s"]
-                if self.stats_total["audio_s"] > 0
-                else 0
-            )
-            self.avg_rtf_label.setText(f"{avg:.3f}")
-        self.total_words_label.setText(str(self.stats_total["words"]))
-        self.chunks_label.setText(str(self.stats_total["chunk_count"]))
-        self.model_load_label.setText(f"{stats.get('model_load_ms', 0):.0f} ms")
+        avg = ""
+        if n > 0 and self.stats_total["audio_s"] > 0:
+            avg = f"{(self.stats_total['latency_ms'] / 1000) / self.stats_total['audio_s']:.3f}"
 
-    def set_settings_enabled(self, enabled: bool):
-        for w in (
-            self.model_combo,
-            self.device_combo_settings,
-            self.compute_combo,
-            self.beam_spin,
-            self.buffer_spin,
-            self.vad_check,
-            self.initial_prompt_check,
-        ):
-            w.setEnabled(enabled)
+        self.stats_panel.update_stats(
+            rtf=f"{stats.get('rtf', 0):.3f}",
+            wps=f"{stats.get('wps', 0):.1f}",
+            latency=f"{stats.get('latency_ms', 0):.0f} ms",
+            avg_rtf=avg,
+            total_words=str(self.stats_total["words"]),
+            chunks=str(self.stats_total["chunk_count"]),
+            model_load=f"{stats.get('model_load_ms', 0):.0f} ms",
+        )
 
-    def load_devices(self):
-        """Load available output devices into the combo box."""
+    # ------------------------------------------------------------------
+    #  Device handling
+    # ------------------------------------------------------------------
+    def _load_devices(self):
+        self.device_combo.blockSignals(True)
         self.device_combo.clear()
         devices = get_output_devices()
-
         if not devices:
+            self.device_combo.blockSignals(False)
             self.device_combo.addItem("No devices found")
-            QMessageBox.warning(self, "No Devices", "No audio output devices found. Please check your audio settings.")
+            QMessageBox.warning(self, "No Devices", "No audio output devices found.")
             return
+        for d in devices:
+            self.device_combo.addItem(d["name"], d["id"])
 
-        for device in devices:
-            self.device_combo.addItem(device["name"], device["id"])
+        # Restore last-used audio source
+        saved_id = load_audio_source()
+        if saved_id:
+            for i in range(self.device_combo.count()):
+                if self.device_combo.itemData(i) == saved_id:
+                    self.device_combo.setCurrentIndex(i)
+                    break
 
-    def on_device_changed(self, index: int):
-        """Handle device selection change."""
-        if index >= 0:
-            device_id = self.device_combo.currentData()
-            device_name = self.device_combo.currentText()
+        self.device_combo.blockSignals(False)
+        # Manually trigger the handler for the current selection
+        self._on_device_changed(self.device_combo.currentIndex())
 
-            # Find corresponding loopback device
-            loopback = find_loopback_for_speaker(device_name, device_id)
-
-            if loopback:
-                self.current_loopback_id = loopback[1]
-                self.status_bar.showMessage(f"Selected: {device_name} -> Loopback: {loopback[0]}")
-            else:
-                self.current_loopback_id = None
-                self.status_bar.showMessage(f"Warning: No loopback found for {device_name}")
-                QMessageBox.warning(
-                    self,
-                    "Loopback Not Found",
-                    f"Could not find a loopback microphone for '{device_name}'.\nRecording may not work correctly.",
-                )
-
-    def toggle_recording(self):
-        """Start or stop recording."""
-        if not self.is_recording:
-            self.start_recording()
+    def _on_device_changed(self, index: int):
+        if index < 0:
+            return
+        device_id = self.device_combo.currentData()
+        device_name = self.device_combo.currentText()
+        if device_id:
+            save_audio_source(device_id)
+        loopback = find_loopback_for_speaker(device_name, device_id)
+        if loopback:
+            self.current_loopback_id = loopback[1]
+            self.status_bar.showMessage(f"Selected: {device_name}  ->  Loopback: {loopback[0]}")
         else:
-            self.stop_recording()
+            self.current_loopback_id = None
+            self.status_bar.showMessage(f"Warning: No loopback found for {device_name}")
+            QMessageBox.warning(
+                self,
+                "Loopback Not Found",
+                f"Could not find a loopback microphone for '{device_name}'.\n"
+                "Recording may not work correctly.",
+            )
 
-    def start_recording(self):
-        """Start audio recording and transcription."""
+    # ------------------------------------------------------------------
+    #  Recording
+    # ------------------------------------------------------------------
+    def _toggle_recording(self):
+        if not self.is_recording:
+            self._start_recording()
+        else:
+            self._stop_recording()
+
+    def _start_recording(self):
         if not self.current_loopback_id:
-            QMessageBox.warning(self, "No Device Selected", "Please select an audio source first.")
+            QMessageBox.warning(self, "No Device", "Please select an audio source first.")
             return
 
         try:
             language = self.language_combo.currentText()
-            cfg = self.get_transcription_config()
+            cfg = self._current_config
 
             self.audio_worker = AudioWorker(self.current_loopback_id)
-            self.audio_worker.error_occurred.connect(self.on_audio_error)
+            self.audio_worker.error_occurred.connect(self._on_audio_error)
             self.audio_worker.start()
 
             self.transcriber_worker = TranscriberWorker(
@@ -390,176 +586,162 @@ class MeetingTranscriberWindow(QMainWindow):
                 vad_filter=cfg["vad_filter"],
                 use_initial_prompt=cfg["use_initial_prompt"],
             )
-            self.transcriber_worker.new_text.connect(self.on_new_transcription)
-            self.transcriber_worker.status_update.connect(self.on_status_update)
-            self.transcriber_worker.error_occurred.connect(self.on_transcription_error)
-            self.transcriber_worker.stats_updated.connect(self.on_stats_updated)
+            self.transcriber_worker.new_text.connect(self._on_new_transcription)
+            self.transcriber_worker.status_update.connect(self._on_status_update)
+            self.transcriber_worker.error_occurred.connect(self._on_transcription_error)
+            self.transcriber_worker.stats_updated.connect(self._on_stats_updated)
             self.transcriber_worker.start()
 
-            # Start translation worker if language is not English
-            language = self.language_combo.currentText()
             if language not in ["en", "auto"]:
-                print("create translation")
                 self.translation_worker = TranslationWorker(source_language=language)
-                self.translation_worker.new_translation.connect(self.on_new_translation)
-                self.translation_worker.error_occurred.connect(self.on_translation_error)
-                self.translation_worker.status_update.connect(self.on_status_update)
+                self.translation_worker.new_translation.connect(self._on_new_translation)
+                self.translation_worker.error_occurred.connect(self._on_translation_error)
+                self.translation_worker.status_update.connect(self._on_status_update)
                 self.translation_worker.start()
             else:
                 self.translation_worker = None
 
-            self.reset_stats()
+            if cfg.get("llm_analysis_enabled", True):
+                self.llm_worker = LLMAnalysisWorker(
+                    interval_s=cfg.get("llm_analysis_interval", 30),
+                )
+                self.llm_worker.new_analysis.connect(self._on_new_analysis)
+                self.llm_worker.error_occurred.connect(self._on_llm_error)
+                self.llm_worker.status_update.connect(self._on_status_update)
+                self.llm_worker.start()
+            else:
+                self.llm_worker = None
 
-            # Update UI
+            self._reset_stats()
+
+            # Update UI state
             self.is_recording = True
-            self.start_stop_btn.setText("STOP RECORDING")
-            self.start_stop_btn.setStyleSheet("""
-                QPushButton {
-                    background-color: #f44336;
-                    color: white;
-                    font-weight: bold;
-                    padding: 10px;
-                    border-radius: 5px;
-                }
-                QPushButton:hover {
-                    background-color: #da190b;
-                }
-            """)
+            self.start_stop_btn.setText("\u25A0  STOP RECORDING")
+            self.start_stop_btn.setStyleSheet(self._rec_btn_style(recording=True))
             self.device_combo.setEnabled(False)
             self.language_combo.setEnabled(False)
-            self.set_settings_enabled(False)
+            self.settings_btn.setEnabled(False)
             self.status_bar.showMessage("Recording...")
 
-            # Add start message to log
             timestamp = datetime.now().strftime("%H:%M:%S")
-            self.append_to_log(f"[{timestamp}] Meeting started...")
+            self._append_to_log(f"[{timestamp}] Meeting started...")
 
         except Exception as e:
-            QMessageBox.critical(self, "Recording Error", f"Failed to start recording:\n{str(e)}")
-            self.stop_recording()
+            QMessageBox.critical(self, "Recording Error", f"Failed to start recording:\n{e}")
+            self._stop_recording()
 
-    def stop_recording(self):
-        """Stop audio recording and transcription."""
+    def _stop_recording(self):
         self.is_recording = False
 
-        # Stop workers
-        if self.audio_worker:
-            self.audio_worker.stop()
-            self.audio_worker.wait(3000)  # Wait up to 3 seconds
-            if self.audio_worker.isRunning():
-                self.audio_worker.terminate()
-            self.audio_worker = None
+        for worker, timeout in [
+            (self.audio_worker, 3000),
+            (self.transcriber_worker, 3000),
+            (self.translation_worker, 3000),
+            (self.llm_worker, 5000),
+        ]:
+            if worker:
+                worker.stop()
+                worker.wait(timeout)
+                if worker.isRunning():
+                    worker.terminate()
 
-        if self.transcriber_worker:
-            self.transcriber_worker.stop()
-            self.transcriber_worker.wait(3000)  # Wait up to 3 seconds
-            if self.transcriber_worker.isRunning():
-                self.transcriber_worker.terminate()
-            self.transcriber_worker = None
+        self.audio_worker = None
+        self.transcriber_worker = None
+        self.translation_worker = None
+        self.llm_worker = None
 
-        if self.translation_worker:
-            self.translation_worker.stop()
-            self.translation_worker.wait(3000)  # Wait up to 3 seconds
-            if self.translation_worker.isRunning():
-                self.translation_worker.terminate()
-            self.translation_worker = None
-
-        # Update UI
-        self.start_stop_btn.setText("START RECORDING")
-        self.start_stop_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #4CAF50;
-                color: white;
-                font-weight: bold;
-                padding: 10px;
-                border-radius: 5px;
-            }
-            QPushButton:hover {
-                background-color: #45a049;
-            }
-        """)
+        self.start_stop_btn.setText("\u25CF  START RECORDING")
+        self.start_stop_btn.setStyleSheet(self._rec_btn_style(recording=False))
         self.device_combo.setEnabled(True)
         self.language_combo.setEnabled(True)
-        self.set_settings_enabled(True)
+        self.settings_btn.setEnabled(True)
         self.status_bar.showMessage("Stopped")
 
-        # Add stop message to log
         timestamp = datetime.now().strftime("%H:%M:%S")
-        self.append_to_log(f"[{timestamp}] Recording stopped.\n")
+        self._append_to_log(f"[{timestamp}] Recording stopped.\n")
 
-    def on_new_transcription(self, text: str, chunk_start: str, chunk_end: str, t_received: str):
-        """Handle new transcribed text."""
-        self.append_to_log(text, chunk_start, chunk_end, t_received)
-
-        # Send to translation worker if active
+    # ------------------------------------------------------------------
+    #  Slots
+    # ------------------------------------------------------------------
+    def _on_new_transcription(self, text: str, chunk_start: str, chunk_end: str, t_received: str):
+        self._append_to_log(text, chunk_start, chunk_end, t_received)
         if self.translation_worker and self.translation_worker.isRunning():
             self.translation_worker.add_text(text)
+        if self.llm_worker and self.llm_worker.isRunning():
+            self.llm_worker.add_text(text)
 
-    def append_to_log(self, text: str, chunk_start: str = "", chunk_end: str = "", t_received: str = ""):
-        """Append text to the transcription log with audio chunk and whisper timestamps."""
+    def _append_to_log(self, text: str, chunk_start: str = "", chunk_end: str = "", t_received: str = ""):
         if chunk_start and chunk_end and t_received:
-            self.text_edit.append(f"[{chunk_start} - {chunk_end}][{t_received}] {text}")
+            html = (
+                f'<span style="color:#585b70; font-size:11px;">'
+                f'{chunk_start} – {chunk_end}'
+                f'</span><br/>'
+                f'<span style="color:#cdd6f4; font-size:14px;">{text}</span>'
+            )
         else:
-            self.text_edit.append(text)
-        # Auto-scroll to bottom
-        scrollbar = self.text_edit.verticalScrollBar()
-        scrollbar.setValue(scrollbar.maximum())
+            # System messages (start/stop) — styled as dim italic
+            html = f'<span style="color:#585b70; font-size:12px; font-style:italic;">{text}</span>'
+        self.text_edit.append(html)
+        sb = self.text_edit.verticalScrollBar()
+        sb.setValue(sb.maximum())
 
-    def on_new_translation(self, text: str):
-        """Handle new translated text."""
+    def _on_new_translation(self, text: str):
         self.translation_edit.append(text)
-        # Auto-scroll to bottom
-        scrollbar = self.translation_edit.verticalScrollBar()
-        scrollbar.setValue(scrollbar.maximum())
+        sb = self.translation_edit.verticalScrollBar()
+        sb.setValue(sb.maximum())
 
-    def clear_log(self):
-        """Clear the transcription log."""
+    def _on_new_analysis(self, text: str):
+        self.analysis_edit.setMarkdown(text)
+
+    def _clear_log(self):
         self.text_edit.clear()
 
-    def clear_translation(self):
-        """Clear the translation log."""
+    def _clear_translation(self):
         self.translation_edit.clear()
 
-    def on_status_update(self, status: str):
-        """Handle status updates from workers."""
-        if not self.is_recording:
-            self.status_bar.showMessage(f"Ready ({status})")
-        else:
-            self.status_bar.showMessage(f"Recording... ({status})")
+    def _clear_analysis(self):
+        self.analysis_edit.clear()
+        if self.llm_worker:
+            self.llm_worker.clear()
 
-    def on_audio_error(self, error_msg: str):
-        """Handle audio worker errors."""
+    def _on_status_update(self, status: str):
+        prefix = "Recording..." if self.is_recording else "Ready"
+        self.status_bar.showMessage(f"{prefix}  ({status})")
+
+    def _on_audio_error(self, error_msg: str):
         QMessageBox.critical(self, "Audio Error", error_msg)
-        self.stop_recording()
+        self._stop_recording()
 
-    def on_transcription_error(self, error_msg: str):
-        """Handle transcription worker errors."""
+    def _on_transcription_error(self, error_msg: str):
         QMessageBox.critical(self, "Transcription Error", error_msg)
-        # Don't stop recording on transcription errors, just log them
 
-    def on_translation_error(self, error_msg: str):
-        """Handle translation worker errors."""
-        # Log translation errors without stopping recording
+    def _on_translation_error(self, error_msg: str):
         print(f"Translation error: {error_msg}")
         self.status_bar.showMessage(f"Translation error: {error_msg}")
 
+    def _on_llm_error(self, error_msg: str):
+        print(f"LLM error: {error_msg}")
+        self.status_bar.showMessage(f"LLM error: {error_msg}")
+
+    # ------------------------------------------------------------------
+    #  Lifecycle
+    # ------------------------------------------------------------------
     def closeEvent(self, event):
-        """Handle window close event - ensure clean shutdown."""
         if self.is_recording:
-            self.stop_recording()
+            self._stop_recording()
         event.accept()
 
 
+# ======================================================================
 def main():
-    """Main entry point."""
     app = QApplication(sys.argv)
-
-    # Set application style
     app.setStyle("Fusion")
+
+    # Apply global stylesheet
+    app.setStyleSheet(APP_STYLESHEET)
 
     window = MeetingTranscriberWindow()
     window.show()
-
     sys.exit(app.exec())
 
 

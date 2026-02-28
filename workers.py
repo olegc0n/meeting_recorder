@@ -1,7 +1,8 @@
 """
-Worker threads for audio capture and transcription.
+Worker threads for audio capture, transcription, and LLM analysis.
 """
 
+import os
 import time
 from datetime import datetime
 import soundcard as sc
@@ -12,6 +13,10 @@ from faster_whisper import WhisperModel
 from typing import Optional
 import argostranslate.package
 import argostranslate.translate
+from dotenv import load_dotenv
+from openai import OpenAI
+
+load_dotenv()
 
 
 class AudioWorker(QThread):
@@ -434,3 +439,148 @@ class TranslationWorker(QThread):
         """Add text to the translation queue."""
         if self.source_language and text.strip():
             self.text_queue.put(text)
+
+
+ANALYSIS_SYSTEM_PROMPT = """\
+You are a meeting analyst assistant. You receive a live transcript of an ongoing meeting.
+Your job is to extract and highlight the most important points from the meeting content.
+
+You will receive:
+1. Your previous analysis (if any) — treat it as your running notes to UPDATE.
+2. The latest transcript window (last ~15 minutes of the meeting).
+
+Output format — use this exact structure (Markdown):
+
+## Key Points
+- Bullet each important point or decision discussed so far.
+
+## Action Items
+- Bullet any tasks, assignments, or follow-ups mentioned (include owner if stated).
+
+## Open Questions
+- Bullet any unresolved questions or topics that need further discussion.
+
+Rules:
+- Be concise — one sentence per bullet.
+- Merge duplicates; keep the latest/most complete version.
+- Preserve important points from your previous analysis even if they are no longer in the transcript window.
+- Remove items from Open Questions if they have been resolved in newer transcript.
+- If the transcript is too short or empty, say "Waiting for more content…"
+- Do NOT invent information. Only report what is in the transcript or your previous analysis.
+- Return ONLY the formatted output above, no extra commentary.
+"""
+
+
+class LLMAnalysisWorker(QThread):
+    """
+    Worker thread that periodically sends the last N minutes of transcript
+    plus the previous analysis to a DeepSeek LLM for incremental updates.
+    """
+
+    new_analysis = Signal(str)       # full analysis text (replaces previous)
+    error_occurred = Signal(str)
+    status_update = Signal(str)
+
+    def __init__(self, interval_s: int = 30, window_minutes: int = 15):
+        """
+        Args:
+            interval_s: How often (seconds) to send text to the LLM.
+            window_minutes: How many minutes of transcript to include.
+        """
+        super().__init__()
+        self.interval_s = interval_s
+        self.window_minutes = window_minutes
+        self.running = False
+
+        # Timestamped transcript entries: list of (datetime, text)
+        self._lock = __import__("threading").Lock()
+        self._entries: list = []
+        self._last_entry_count: int = 0  # avoid re-sending identical data
+        self._previous_analysis: str = ""  # last LLM response
+
+        api_key = os.getenv("DEEPSEEK_API_KEY", "")
+        base_url = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
+        if not api_key:
+            print("WARNING: DEEPSEEK_API_KEY not set in .env")
+        self.client = OpenAI(api_key=api_key, base_url=base_url)
+
+    # ---- public API (called from GUI thread) ----
+
+    def add_text(self, text: str):
+        """Append new timestamped transcription text (thread-safe)."""
+        with self._lock:
+            self._entries.append((datetime.now(), text.strip()))
+
+    def clear(self):
+        """Clear accumulated transcript and previous analysis."""
+        with self._lock:
+            self._entries.clear()
+            self._last_entry_count = 0
+            self._previous_analysis = ""
+
+    # ---- thread loop ----
+
+    def _get_recent_transcript(self) -> str:
+        """Return transcript text from the last `window_minutes` minutes."""
+        cutoff = datetime.now() - __import__("datetime").timedelta(minutes=self.window_minutes)
+        with self._lock:
+            recent = [text for ts, text in self._entries if ts >= cutoff]
+        return " ".join(recent).strip()
+
+    def run(self):
+        self.running = True
+        self.status_update.emit("LLM analysis active")
+
+        while self.running:
+            # Sleep in small increments so we can stop promptly
+            for _ in range(self.interval_s * 10):
+                if not self.running:
+                    return
+                self.msleep(100)
+
+            # Check if there's new data
+            with self._lock:
+                current_count = len(self._entries)
+            if current_count == 0 or current_count == self._last_entry_count:
+                continue  # nothing new
+
+            self._last_entry_count = current_count
+
+            transcript_window = self._get_recent_transcript()
+            if not transcript_window:
+                continue
+
+            # Build user message with previous analysis + recent transcript
+            parts = []
+            if self._previous_analysis:
+                parts.append(
+                    f"Your previous analysis:\n\n{self._previous_analysis}\n\n---\n"
+                )
+            parts.append(
+                f"Latest transcript (last ~{self.window_minutes} min):\n\n{transcript_window}"
+            )
+            user_message = "\n".join(parts)
+
+            try:
+                self.status_update.emit("Analyzing meeting…")
+                response = self.client.chat.completions.create(
+                    model="deepseek-chat",
+                    messages=[
+                        {"role": "system", "content": ANALYSIS_SYSTEM_PROMPT},
+                        {"role": "user", "content": user_message},
+                    ],
+                    temperature=0.3,
+                    max_tokens=1024,
+                )
+                analysis = response.choices[0].message.content.strip()
+                self._previous_analysis = analysis
+                self.new_analysis.emit(analysis)
+                self.status_update.emit("LLM analysis updated")
+            except Exception as e:
+                error_msg = f"LLM analysis error: {e}"
+                self.error_occurred.emit(error_msg)
+                print(error_msg)
+
+    def stop(self):
+        """Stop the analysis loop."""
+        self.running = False
