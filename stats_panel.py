@@ -8,19 +8,14 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QPushButton,
-    QFormLayout,
     QFrame,
-    QGraphicsOpacityEffect,
 )
 from PySide6.QtCore import (
     Qt,
+    QPoint,
     QPropertyAnimation,
     QEasingCurve,
-    QParallelAnimationGroup,
-    Property,
-    QSize,
 )
-from PySide6.QtGui import QColor
 
 
 PANEL_STYLE = """
@@ -82,7 +77,7 @@ class StatsPanel(QWidget):
     Call toggle() to animate it in/out.
     """
 
-    PANEL_WIDTH = 220
+    PANEL_WIDTH = 260
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -162,6 +157,38 @@ class StatsPanel(QWidget):
         self.model_load_stat = StatValue("Model Load")
         layout.addWidget(self.model_load_stat)
 
+        sep3 = QFrame()
+        sep3.setObjectName("statsSeparator")
+        sep3.setFrameShape(QFrame.HLine)
+        layout.addWidget(sep3)
+
+        llm_title = QLabel("LLM (DeepSeek)")
+        llm_title.setObjectName("statsPanelTitle")
+        layout.addWidget(llm_title)
+
+        self.llm_prompt_tokens_stat = StatValue(
+            "Prompt Tokens", "Cumulative input tokens sent to the LLM"
+        )
+        layout.addWidget(self.llm_prompt_tokens_stat)
+
+        self.llm_completion_tokens_stat = StatValue(
+            "Completion Tokens", "Cumulative output tokens received from the LLM"
+        )
+        layout.addWidget(self.llm_completion_tokens_stat)
+
+        self.llm_total_tokens_stat = StatValue(
+            "Total Tokens", "Cumulative total tokens (prompt + completion)"
+        )
+        layout.addWidget(self.llm_total_tokens_stat)
+
+        self.llm_cost_stat = StatValue(
+            "Est. Cost (USD)",
+            "Estimated cost based on DeepSeek pricing\n"
+            "Input: $0.27 / 1M tokens\n"
+            "Output: $1.10 / 1M tokens",
+        )
+        layout.addWidget(self.llm_cost_stat)
+
         layout.addStretch()
 
     # ---- animation helpers ----
@@ -202,7 +229,6 @@ class StatsPanel(QWidget):
         anim = QPropertyAnimation(self, b"pos", self)
         anim.setDuration(250)
         anim.setEasingCurve(QEasingCurve.OutCubic)
-        from PySide6.QtCore import QPoint
         anim.setStartValue(QPoint(start_x, 0))
         anim.setEndValue(QPoint(end_x, 0))
         if not visible:
@@ -216,10 +242,8 @@ class StatsPanel(QWidget):
             return
         self.setFixedHeight(parent.height())
         if self._visible:
-            from PySide6.QtCore import QPoint
             self.move(parent.width() - self.PANEL_WIDTH, 0)
         else:
-            from PySide6.QtCore import QPoint
             self.move(parent.width(), 0)
 
     # ---- public update API ----
@@ -232,11 +256,17 @@ class StatsPanel(QWidget):
             self.total_words_stat,
             self.chunks_stat,
             self.model_load_stat,
+            self.llm_prompt_tokens_stat,
+            self.llm_completion_tokens_stat,
+            self.llm_total_tokens_stat,
+            self.llm_cost_stat,
         ):
             w.set_value("—")
 
     def update_stats(self, *, rtf="", wps="", latency="", avg_rtf="",
-                     total_words="", chunks="", model_load=""):
+                     total_words="", chunks="", model_load="",
+                     llm_prompt_tokens="", llm_completion_tokens="",
+                     llm_total_tokens="", llm_cost=""):
         if rtf:
             self.rtf_stat.set_value(rtf)
         if wps:
@@ -251,3 +281,11 @@ class StatsPanel(QWidget):
             self.chunks_stat.set_value(chunks)
         if model_load:
             self.model_load_stat.set_value(model_load)
+        if llm_prompt_tokens:
+            self.llm_prompt_tokens_stat.set_value(llm_prompt_tokens)
+        if llm_completion_tokens:
+            self.llm_completion_tokens_stat.set_value(llm_completion_tokens)
+        if llm_total_tokens:
+            self.llm_total_tokens_stat.set_value(llm_total_tokens)
+        if llm_cost:
+            self.llm_cost_stat.set_value(llm_cost)

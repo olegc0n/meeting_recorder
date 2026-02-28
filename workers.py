@@ -4,7 +4,10 @@ Worker threads for audio capture, transcription, and LLM analysis.
 
 import os
 import time
-from datetime import datetime
+import threading
+import logging
+import logging.handlers
+from datetime import datetime, timedelta
 import soundcard as sc
 import numpy as np
 from queue import Queue, Empty
@@ -17,6 +20,38 @@ from dotenv import load_dotenv
 from openai import OpenAI
 
 load_dotenv()
+
+# ---------------------------------------------------------------------------
+#  LLM debug logger — writes to llm_debug.log (rotates at 5 MB, keeps 3 files)
+# ---------------------------------------------------------------------------
+_llm_logger = logging.getLogger("llm_debug")
+_llm_logger.setLevel(logging.DEBUG)
+if not _llm_logger.handlers:
+    _log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "llm_debug.log")
+    _fh = logging.handlers.RotatingFileHandler(
+        _log_path, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"
+    )
+    _fh.setFormatter(logging.Formatter(
+        "%(asctime)s  %(levelname)-8s  %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    ))
+    _llm_logger.addHandler(_fh)
+
+# ---------------------------------------------------------------------------
+#  General app logger — writes to app.log (rotates at 5 MB, keeps 3 files)
+# ---------------------------------------------------------------------------
+_log = logging.getLogger("app")
+_log.setLevel(logging.INFO)
+if not _log.handlers:
+    _app_log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "app.log")
+    _app_fh = logging.handlers.RotatingFileHandler(
+        _app_log_path, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"
+    )
+    _app_fh.setFormatter(logging.Formatter(
+        "%(asctime)s  %(levelname)-8s  [%(name)s]  %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    ))
+    _log.addHandler(_app_fh)
 
 
 class AudioWorker(QThread):
@@ -50,6 +85,8 @@ class AudioWorker(QThread):
             # Open loopback device (API exposes it as a "microphone" that captures speaker output)
             self.microphone = sc.get_microphone(self.device_id, include_loopback=True)
             self.running = True
+            _log.info("AudioWorker started  device_id=%s  sample_rate=%d  chunk_size=%d",
+                      self.device_id, self.sample_rate, self.chunk_size)
 
             # Record audio in chunks
             with self.microphone.recorder(samplerate=self.sample_rate) as mic:
@@ -70,11 +107,13 @@ class AudioWorker(QThread):
 
         except Exception as e:
             error_msg = f"Audio capture error: {str(e)}"
+            _log.error("AudioWorker error: %s", e, exc_info=True)
             self.error_occurred.emit(error_msg)
             print(error_msg)
 
     def stop(self):
         """Stop the recording loop."""
+        _log.info("AudioWorker stopping")
         self.running = False
 
     def get_queue(self) -> Queue:
@@ -96,6 +135,10 @@ QUEUE_BACKLOG_WARN = 20   # audio chunks piled up
 QUEUE_BACKLOG_CRIT = 50
 LLM_RESPONSE_WARN_S = 15  # seconds
 LLM_RESPONSE_CRIT_S = 30
+
+# DeepSeek pricing (USD per 1 million tokens) — update if pricing changes
+DEEPSEEK_INPUT_PRICE_PER_1M = 0.27
+DEEPSEEK_OUTPUT_PRICE_PER_1M = 1.10
 
 
 class TranscriberWorker(QThread):
@@ -166,6 +209,12 @@ class TranscriberWorker(QThread):
             device = self.device
             if device == "auto":
                 device = "cuda"
+            _log.info(
+                "TranscriberWorker loading model  model=%s  device=%s  compute_type=%s  "
+                "beam_size=%d  buffer_duration=%.1fs  vad=%s  initial_prompt=%s",
+                self.model_size, device, self.compute_type,
+                self.beam_size, self.buffer_duration, self.vad_filter, self.use_initial_prompt,
+            )
             try:
                 self.model = WhisperModel(
                     self.model_size,
@@ -174,6 +223,7 @@ class TranscriberWorker(QThread):
                 )
             except Exception:
                 if device == "cuda":
+                    _log.warning("CUDA load failed — falling back to CPU")
                     self.model = WhisperModel(
                         self.model_size,
                         device="cpu",
@@ -183,6 +233,7 @@ class TranscriberWorker(QThread):
                 else:
                     raise
             model_load_ms = (time.perf_counter() - t0) * 1000
+            _log.info("TranscriberWorker model ready  device=%s  load_time=%.0fms", device, model_load_ms)
             self.status_update.emit(f"Model loaded ({model_load_ms:.0f}ms)")
 
             self.running = True
@@ -220,6 +271,7 @@ class TranscriberWorker(QThread):
                         silence_triggered = rms < self.silence_threshold
 
                     if buffer_full or silence_triggered:
+                        trigger = "buffer_full" if buffer_full else "silence"
                         audio_to_transcribe = self.audio_buffer.copy()
                         chunk_start_time = self._chunk_start_time
                         chunk_end_time = datetime.now()
@@ -239,6 +291,15 @@ class TranscriberWorker(QThread):
 
                         audio_duration_s = len(audio_to_transcribe) / self.sample_rate
 
+                        _log.info(
+                            "Transcribing  trigger=%s  audio_duration=%.2fs  "
+                            "overlap=%.2fs  queue_backlog=%d",
+                            trigger,
+                            audio_duration_s,
+                            self._overlap_s,
+                            self.audio_queue.qsize(),
+                        )
+
                         t_sent = datetime.now()
                         t_start = time.perf_counter()
                         segments, info = self.model.transcribe(
@@ -248,7 +309,7 @@ class TranscriberWorker(QThread):
                             vad_filter=self.vad_filter,
                             # Provide previous transcript as context so Whisper
                             # can carry over vocabulary, style and proper nouns.
-                            initial_prompt=self.context_prompt or None if self.use_initial_prompt else None,
+                            initial_prompt=(self.context_prompt or None) if self.use_initial_prompt else None,
                         )
 
                         # Iterate the generator — actual decoding happens here
@@ -289,6 +350,14 @@ class TranscriberWorker(QThread):
                             })
 
                         if transcribed_text.strip():
+                            _log.info(
+                                "Transcription result  words=%d  rtf=%.3f  latency=%.0fms  "
+                                "text=%r",
+                                len(transcribed_text.split()),
+                                transcribe_ms / 1000 / audio_duration_s if audio_duration_s > 0 else 0,
+                                transcribe_ms,
+                                transcribed_text.strip()[:120],
+                            )
                             # Update rolling context (keep last N words)
                             combined = (self.context_prompt + " " + transcribed_text).split()
                             self.context_prompt = " ".join(combined[-self._max_prompt_words:])
@@ -336,37 +405,51 @@ class TranscriberWorker(QThread):
                                     "detail": f"Whisper RTF {rtf:.2f}",
                                 })
 
+                        else:
+                            _log.info(
+                                "Transcription empty (no speech detected)  "
+                                "audio_duration=%.2fs  trigger=%s",
+                                audio_duration_s, trigger,
+                            )
+
                 except Exception as e:
                     error_msg = f"Transcription error: {str(e)}"
+                    _log.error("TranscriberWorker chunk error: %s", e, exc_info=True)
                     self.error_occurred.emit(error_msg)
                     print(error_msg)
 
         except Exception as e:
             error_msg = f"Model loading error: {str(e)}"
+            _log.error("TranscriberWorker model load error: %s", e, exc_info=True)
             self.status_update.emit("Error loading model")
             self.error_occurred.emit(error_msg)
             print(error_msg)
 
     def stop(self):
         """Stop the transcription loop."""
+        _log.info("TranscriberWorker stopping")
         self.running = False
 
         # Transcribe any remaining audio in buffer
         if self.model is not None and len(self.audio_buffer) > self.sample_rate:
+            _log.info("TranscriberWorker flushing final buffer  samples=%d", len(self.audio_buffer))
             try:
                 segments, _ = self.model.transcribe(
                     self.audio_buffer,
                     language=self.language,
                     beam_size=self.beam_size,
                     vad_filter=self.vad_filter,
-                    initial_prompt=self.context_prompt or None if self.use_initial_prompt else None,
+                    initial_prompt=(self.context_prompt or None) if self.use_initial_prompt else None,
                 )
                 transcribed_text = ""
                 for segment in segments:
                     transcribed_text += segment.text.strip() + " "
                 if transcribed_text.strip():
-                    self.new_text.emit(transcribed_text.strip())
+                    _log.info("Final buffer text: %r", transcribed_text.strip()[:120])
+                    now = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+                    self.new_text.emit(transcribed_text.strip(), now, now, now)
             except Exception as e:
+                _log.error("Error transcribing final buffer: %s", e, exc_info=True)
                 print(f"Error transcribing final buffer: {e}")
 
         self.audio_buffer = np.array([], dtype=np.float32)
@@ -376,6 +459,7 @@ class TranscriberWorker(QThread):
 
     def set_language(self, language: str):
         """Update the language setting."""
+        _log.info("TranscriberWorker language changed to %r", language)
         self.language = language if language != "auto" else None
         self.context_prompt = ""  # reset context when language changes
         self._overlap_s = 0.0
@@ -402,13 +486,15 @@ class TranslationWorker(QThread):
         self.source_language = source_language if source_language not in ["en", "auto"] else None
         self.text_queue = Queue()
         self.running = False
-        self.installed_translation = None
+        self._from_lang = None
+        self._to_lang = None
 
     def run(self):
         """Main translation loop."""
         try:
             # Initialize translator if source language is not English
             if self.source_language:
+                _log.info("TranslationWorker initialising  source=%s", self.source_language)
                 # Update and get available packages
                 argostranslate.package.update_package_index()
                 available_packages = argostranslate.package.get_available_packages()
@@ -428,14 +514,29 @@ class TranslationWorker(QThread):
                     )
 
                     if not already_installed:
+                        _log.info("Downloading translation package %s→en", self.source_language)
                         self.status_update.emit(f"Downloading {self.source_language}→en translation model...")
                         argostranslate.package.install_from_path(package_to_install.download())
+                        _log.info("Translation package installed %s→en", self.source_language)
                         self.status_update.emit("Translation model ready")
+                    else:
+                        _log.info("Translation package already installed %s→en", self.source_language)
 
-                    # Get the installed translation
-                    self.installed_translation = argostranslate.translate.get_installed_languages()
+                    # Cache the language objects for reuse in the loop
+                    installed_langs = argostranslate.translate.get_installed_languages()
+                    self._from_lang = next(
+                        (lang for lang in installed_langs if lang.code == self.source_language), None
+                    )
+                    self._to_lang = next(
+                        (lang for lang in installed_langs if lang.code == "en"), None
+                    )
+                    _log.info(
+                        "TranslationWorker ready  from_lang=%s  to_lang=%s",
+                        self._from_lang, self._to_lang,
+                    )
                 else:
                     error_msg = f"Translation package not available for {self.source_language} → en"
+                    _log.error("%s", error_msg)
                     self.error_occurred.emit(error_msg)
                     print(error_msg)
                     return
@@ -450,31 +551,19 @@ class TranslationWorker(QThread):
                     # Translate if translator is initialized
                     if self.source_language and text.strip():
                         try:
-                            from_lang = next(
-                                (
-                                    lang
-                                    for lang in argostranslate.translate.get_installed_languages()
-                                    if lang.code == self.source_language
-                                ),
-                                None,
-                            )
-                            to_lang = next(
-                                (
-                                    lang
-                                    for lang in argostranslate.translate.get_installed_languages()
-                                    if lang.code == "en"
-                                ),
-                                None,
-                            )
-
-                            if from_lang and to_lang:
-                                translation = from_lang.get_translation(to_lang)
+                            if self._from_lang and self._to_lang:
+                                translation = self._from_lang.get_translation(self._to_lang)
                                 if translation:
                                     translated = translation.translate(text)
                                     if translated and translated.strip():
+                                        _log.info(
+                                            "Translation  in=%r  out=%r",
+                                            text[:80], translated[:80],
+                                        )
                                         self.new_translation.emit(translated.strip())
                         except Exception as e:
                             error_msg = f"Translation error: {str(e)}"
+                            _log.error("TranslationWorker translate error: %s", e, exc_info=True)
                             self.error_occurred.emit(error_msg)
                             print(error_msg)
 
@@ -482,16 +571,19 @@ class TranslationWorker(QThread):
                     continue
                 except Exception as e:
                     error_msg = f"Translation queue error: {str(e)}"
+                    _log.error("TranslationWorker queue error: %s", e, exc_info=True)
                     self.error_occurred.emit(error_msg)
                     print(error_msg)
 
         except Exception as e:
             error_msg = f"Translation worker error: {str(e)}"
+            _log.error("TranslationWorker fatal error: %s", e, exc_info=True)
             self.error_occurred.emit(error_msg)
             print(error_msg)
 
     def stop(self):
         """Stop the translation loop."""
+        _log.info("TranslationWorker stopping")
         self.running = False
 
     def add_text(self, text: str):
@@ -541,6 +633,9 @@ class LLMAnalysisWorker(QThread):
     status_update = Signal(str)
     # Emits dict with component health: {"component": str, "level": str, "detail": str}
     performance_alert = Signal(dict)
+    # Emits cumulative token usage: {"prompt_tokens": int, "completion_tokens": int,
+    #                                "total_tokens": int, "estimated_cost_usd": float}
+    token_stats_updated = Signal(dict)
 
     def __init__(self, interval_s: int = 30, window_minutes: int = 15):
         """
@@ -554,7 +649,7 @@ class LLMAnalysisWorker(QThread):
         self.running = False
 
         # Timestamped transcript entries: list of (datetime, text)
-        self._lock = __import__("threading").Lock()
+        self._lock = threading.Lock()
         self._entries: list = []
         self._last_entry_count: int = 0  # avoid re-sending identical data
         self._previous_analysis: str = ""  # last LLM response
@@ -562,8 +657,13 @@ class LLMAnalysisWorker(QThread):
         api_key = os.getenv("DEEPSEEK_API_KEY", "")
         base_url = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
         if not api_key:
+            _log.warning("DEEPSEEK_API_KEY not set in .env — LLM calls will fail")
             print("WARNING: DEEPSEEK_API_KEY not set in .env")
         self.client = OpenAI(api_key=api_key, base_url=base_url)
+
+        # Cumulative token counters for the current session
+        self._total_prompt_tokens: int = 0
+        self._total_completion_tokens: int = 0
 
     # ---- public API (called from GUI thread) ----
 
@@ -573,23 +673,29 @@ class LLMAnalysisWorker(QThread):
             self._entries.append((datetime.now(), text.strip()))
 
     def clear(self):
-        """Clear accumulated transcript and previous analysis."""
+        """Clear accumulated transcript, previous analysis, and token counters."""
         with self._lock:
             self._entries.clear()
             self._last_entry_count = 0
             self._previous_analysis = ""
+        self._total_prompt_tokens = 0
+        self._total_completion_tokens = 0
 
     # ---- thread loop ----
 
     def _get_recent_transcript(self) -> str:
         """Return transcript text from the last `window_minutes` minutes."""
-        cutoff = datetime.now() - __import__("datetime").timedelta(minutes=self.window_minutes)
+        cutoff = datetime.now() - timedelta(minutes=self.window_minutes)
         with self._lock:
             recent = [text for ts, text in self._entries if ts >= cutoff]
         return " ".join(recent).strip()
 
     def run(self):
         self.running = True
+        _log.info(
+            "LLMAnalysisWorker started  interval=%ds  window=%dmin",
+            self.interval_s, self.window_minutes,
+        )
         self.status_update.emit("LLM analysis active")
 
         while self.running:
@@ -603,6 +709,7 @@ class LLMAnalysisWorker(QThread):
             with self._lock:
                 current_count = len(self._entries)
             if current_count == 0 or current_count == self._last_entry_count:
+                _log.info("LLM skipping — no new transcript entries (total=%d)", current_count)
                 continue  # nothing new
 
             self._last_entry_count = current_count
@@ -624,6 +731,12 @@ class LLMAnalysisWorker(QThread):
 
             try:
                 self.status_update.emit("Analyzing meeting…")
+
+                _llm_logger.info("=" * 72)
+                _llm_logger.info("REQUEST  model=deepseek-chat  temperature=0.3  max_tokens=1024")
+                _llm_logger.info("[SYSTEM PROMPT]\n%s", ANALYSIS_SYSTEM_PROMPT)
+                _llm_logger.info("[USER MESSAGE]\n%s", user_message)
+
                 llm_t0 = time.perf_counter()
                 response = self.client.chat.completions.create(
                     model="deepseek-chat",
@@ -636,9 +749,41 @@ class LLMAnalysisWorker(QThread):
                 )
                 llm_elapsed_s = time.perf_counter() - llm_t0
                 analysis = response.choices[0].message.content.strip()
+
+                _llm_logger.info(
+                    "RESPONSE  elapsed=%.2fs  finish_reason=%s",
+                    llm_elapsed_s,
+                    response.choices[0].finish_reason,
+                )
+                if response.usage:
+                    _llm_logger.info(
+                        "TOKENS  prompt=%d  completion=%d  total=%d",
+                        response.usage.prompt_tokens,
+                        response.usage.completion_tokens,
+                        response.usage.total_tokens,
+                    )
+                _llm_logger.info("[RESPONSE CONTENT]\n%s", analysis)
+
                 self._previous_analysis = analysis
                 self.new_analysis.emit(analysis)
                 self.status_update.emit(f"LLM analysis updated ({llm_elapsed_s:.1f}s)")
+
+                # Track and emit token usage
+                usage = response.usage
+                if usage:
+                    self._total_prompt_tokens += usage.prompt_tokens
+                    self._total_completion_tokens += usage.completion_tokens
+                    total = self._total_prompt_tokens + self._total_completion_tokens
+                    cost = (
+                        self._total_prompt_tokens * DEEPSEEK_INPUT_PRICE_PER_1M / 1_000_000
+                        + self._total_completion_tokens * DEEPSEEK_OUTPUT_PRICE_PER_1M / 1_000_000
+                    )
+                    self.token_stats_updated.emit({
+                        "prompt_tokens": self._total_prompt_tokens,
+                        "completion_tokens": self._total_completion_tokens,
+                        "total_tokens": total,
+                        "estimated_cost_usd": cost,
+                    })
 
                 # --- Performance health check: LLM response time ---
                 if llm_elapsed_s >= LLM_RESPONSE_CRIT_S:
@@ -661,6 +806,7 @@ class LLMAnalysisWorker(QThread):
                     })
             except Exception as e:
                 error_msg = f"LLM analysis error: {e}"
+                _llm_logger.error("LLM call failed: %s", e, exc_info=True)
                 self.error_occurred.emit(error_msg)
                 self.performance_alert.emit({
                     "component": "llm",

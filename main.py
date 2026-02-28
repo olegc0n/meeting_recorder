@@ -20,8 +20,8 @@ from PySide6.QtWidgets import (
     QFrame,
     QSizePolicy,
 )
-from PySide6.QtCore import Qt, QSize, QTimer
-from PySide6.QtGui import QFont, QIcon, QColor
+from PySide6.QtCore import Qt, QTimer
+from PySide6.QtGui import QFont
 
 from workers import (
     AudioWorker, TranscriberWorker, TranslationWorker, LLMAnalysisWorker,
@@ -666,6 +666,19 @@ class MeetingTranscriberWindow(QMainWindow):
         self.stats_total = {"words": 0, "audio_s": 0, "latency_ms": 0, "chunk_count": 0}
         self.stats_panel.reset()
 
+    def _on_llm_token_stats(self, token_stats: dict):
+        """Update the statistics panel with LLM token usage and cost."""
+        prompt = token_stats.get("prompt_tokens", 0)
+        completion = token_stats.get("completion_tokens", 0)
+        total = token_stats.get("total_tokens", 0)
+        cost = token_stats.get("estimated_cost_usd", 0.0)
+        self.stats_panel.update_stats(
+            llm_prompt_tokens=f"{prompt:,}",
+            llm_completion_tokens=f"{completion:,}",
+            llm_total_tokens=f"{total:,}",
+            llm_cost=f"${cost:.6f}",
+        )
+
     def _on_stats_updated(self, stats: dict):
         self.stats_total["words"] += stats.get("words", 0)
         self.stats_total["audio_s"] += stats.get("audio_s", 0)
@@ -792,6 +805,7 @@ class MeetingTranscriberWindow(QMainWindow):
                 self.llm_worker.error_occurred.connect(self._on_llm_error)
                 self.llm_worker.status_update.connect(self._on_status_update)
                 self.llm_worker.performance_alert.connect(self._on_performance_alert)
+                self.llm_worker.token_stats_updated.connect(self._on_llm_token_stats)
                 self.llm_worker.start()
             else:
                 self.llm_worker = None
