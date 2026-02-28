@@ -20,10 +20,13 @@ from PySide6.QtWidgets import (
     QFrame,
     QSizePolicy,
 )
-from PySide6.QtCore import Qt, QSize
+from PySide6.QtCore import Qt, QSize, QTimer
 from PySide6.QtGui import QFont, QIcon, QColor
 
-from workers import AudioWorker, TranscriberWorker, TranslationWorker, LLMAnalysisWorker
+from workers import (
+    AudioWorker, TranscriberWorker, TranslationWorker, LLMAnalysisWorker,
+    HEALTH_OK, HEALTH_WARN, HEALTH_CRITICAL,
+)
 from utils import get_output_devices, find_loopback_for_speaker
 from config import load_transcription_config, save_transcription_config, load_audio_source, save_audio_source
 from settings_dialog import SettingsDialog
@@ -168,7 +171,182 @@ QSplitter::handle:horizontal {
 QSplitter::handle:vertical {
     height: 2px;
 }
+
+/* ---- Tooltips ---- */
+QToolTip {
+    background-color: #1e1e2e;
+    color: #cdd6f4;
+    border: 1px solid #45475a;
+    border-radius: 8px;
+    padding: 8px 10px;
+    font-size: 12px;
+    opacity: 240;
+}
 """
+
+
+# ---------------------------------------------------------------------------
+#  Health-indicator widget – coloured dots per monitored component
+# ---------------------------------------------------------------------------
+_HEALTH_COLORS = {
+    HEALTH_OK: "#a6e3a1",       # green
+    HEALTH_WARN: "#f9e2af",     # yellow
+    HEALTH_CRITICAL: "#f38ba8", # red
+}
+
+
+# Per-component static metadata used to build rich tooltips.
+_COMPONENT_META = {
+    "whisper": {
+        "label": "Whisper (STT)",
+        "metric": "Real-Time Factor (RTF)",
+        "description": "RTF = transcription time ÷ audio duration.\n"
+                        "RTF < 1 means Whisper is faster than real-time.",
+        "warn": f"RTF ≥ {0.8:.1f}  → model is slower than ideal",
+        "crit": f"RTF ≥ {1.0:.1f}  → model can't keep up with audio (try a smaller model or GPU)",
+    },
+    "audio_queue": {
+        "label": "Audio Queue",
+        "metric": "Backlog (buffered chunks)",
+        "description": "Number of audio chunks waiting to be transcribed.\n"
+                        "High backlog means transcription is falling behind capture.",
+        "warn": "Backlog ≥ 20 chunks → processing falling behind",
+        "crit": "Backlog ≥ 50 chunks → severe latency, consider smaller model or faster device",
+    },
+    "llm": {
+        "label": "LLM Analysis",
+        "metric": "Response time (seconds)",
+        "description": "How long the DeepSeek API took to return the meeting analysis.",
+        "warn": "Response ≥ 15 s → API is slow",
+        "crit": "Response ≥ 30 s → API timeout risk, check network / API key",
+    },
+}
+
+_LEVEL_LABELS = {
+    HEALTH_OK: ("OK", "#a6e3a1"),
+    HEALTH_WARN: ("Warning", "#f9e2af"),
+    HEALTH_CRITICAL: ("Critical", "#f38ba8"),
+}
+
+
+class _DotLabel(QLabel):
+    """A small coloured circle + text label for one component."""
+
+    def __init__(self, component_key: str, parent=None):
+        super().__init__(parent)
+        self._level = HEALTH_OK
+        self._component_key = component_key
+        meta = _COMPONENT_META.get(component_key, {})
+        self._name = meta.get("label", component_key.replace("_", " ").title())
+        self._detail = ""
+        self._update_display()
+        self.setCursor(Qt.PointingHandCursor)
+        # Enable rich-text tooltips
+        self.setToolTipDuration(8000)
+
+    def set_health(self, level: str, detail: str = ""):
+        if level == self._level and detail == self._detail:
+            return
+        self._level = level
+        self._detail = detail
+        self._update_display()
+
+    @property
+    def level(self) -> str:
+        return self._level
+
+    def _update_display(self):
+        color = _HEALTH_COLORS.get(self._level, _HEALTH_COLORS[HEALTH_OK])
+        self.setText(f'<span style="color:{color}; font-size:18px;">●</span>'
+                     f'<span style="color:#a6adc8; font-size:11px;"> {self._name}</span>')
+        self.setToolTip(self._build_tooltip())
+
+    def _build_tooltip(self) -> str:
+        meta = _COMPONENT_META.get(self._component_key, {})
+        level_text, level_color = _LEVEL_LABELS.get(self._level, ("OK", "#a6e3a1"))
+
+        current_value_row = ""
+        if self._detail:
+            current_value_row = (
+                f'<tr><td style="color:#a6adc8;">Current&nbsp;value:</td>'
+                f'<td style="color:#cdd6f4; font-weight:600;">&#160;{self._detail}</td></tr>'
+            )
+
+        return (
+            f'<html><body style="font-family: sans-serif; font-size: 12px;">'
+            f'<b style="font-size:13px; color:#cdd6f4;">{meta.get("label", self._name)}</b><br/>'
+            f'<table cellpadding="2" cellspacing="0" style="margin-top:6px;">'
+            f'<tr><td style="color:#a6adc8;">Metric:</td>'
+            f'<td style="color:#cdd6f4;">&#160;{meta.get("metric", "—")}</td></tr>'
+            f'{current_value_row}'
+            f'<tr><td style="color:#a6adc8;">Status:</td>'
+            f'<td style="color:{level_color}; font-weight:600;">&#160;{level_text}</td></tr>'
+            f'</table>'
+            f'<hr style="border:0; border-top:1px solid #45475a; margin:6px 0;"/>'
+            f'<span style="color:#a6adc8; font-size:11px;">{meta.get("description", "").replace(chr(10), "<br/>")}</span><br/>'
+            f'<span style="color:#f9e2af; font-size:11px;">⚠ {meta.get("warn", "")}</span><br/>'
+            f'<span style="color:#f38ba8; font-size:11px;">✖ {meta.get("crit", "")}</span>'
+            f'</body></html>'
+        )
+
+
+class HealthIndicator(QWidget):
+    """Compact row of health dots shown in the top bar."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(4, 0, 4, 0)
+        layout.setSpacing(10)
+
+        self.dots: dict[str, _DotLabel] = {}
+        for component in ("whisper", "audio_queue", "llm"):
+            dot = _DotLabel(component)
+            self.dots[component] = dot
+            layout.addWidget(dot)
+
+        # Overall summary label (shows worst level in words)
+        self.summary_label = QLabel()
+        self.summary_label.setStyleSheet("color: #a6adc8; font-size: 11px;")
+        layout.addWidget(self.summary_label)
+        self._update_summary()
+
+        # Auto-decay timer: if no update arrives within 60s, fall back to OK
+        self._decay_timer = QTimer(self)
+        self._decay_timer.setInterval(60_000)
+        self._decay_timer.timeout.connect(self._decay_to_ok)
+
+    def update_component(self, component: str, level: str, detail: str = ""):
+        dot = self.dots.get(component)
+        if dot is None:
+            return
+        dot.set_health(level, detail)
+        self._update_summary()
+        self._decay_timer.start()  # restart decay countdown
+
+    def reset(self):
+        for dot in self.dots.values():
+            dot.set_health(HEALTH_OK, "")
+        self._update_summary()
+        self._decay_timer.stop()
+
+    def _decay_to_ok(self):
+        """Reset all components to OK if nothing reported for a while."""
+        for dot in self.dots.values():
+            dot.set_health(HEALTH_OK, "")
+        self._update_summary()
+
+    def _update_summary(self):
+        levels = [d.level for d in self.dots.values()]
+        if HEALTH_CRITICAL in levels:
+            self.summary_label.setText("Performance issue!")
+            self.summary_label.setStyleSheet("color: #f38ba8; font-size: 11px; font-weight: 600;")
+        elif HEALTH_WARN in levels:
+            self.summary_label.setText("Degraded")
+            self.summary_label.setStyleSheet("color: #f9e2af; font-size: 11px; font-weight: 600;")
+        else:
+            self.summary_label.setText("")
+            self.summary_label.setStyleSheet("color: #a6adc8; font-size: 11px;")
 
 
 # ---------------------------------------------------------------------------
@@ -301,6 +479,10 @@ class MeetingTranscriberWindow(QMainWindow):
         self.stats_btn = _icon_button("\U0001F4CA", "Toggle statistics panel")
         self.stats_btn.clicked.connect(self._toggle_stats)
         bar.addWidget(self.stats_btn)
+
+        # Health indicator (performance dots)
+        self.health_indicator = HealthIndicator()
+        bar.addWidget(self.health_indicator)
 
         # Settings gear
         self.settings_btn = _icon_button("\u2699", "Open settings")
@@ -590,6 +772,7 @@ class MeetingTranscriberWindow(QMainWindow):
             self.transcriber_worker.status_update.connect(self._on_status_update)
             self.transcriber_worker.error_occurred.connect(self._on_transcription_error)
             self.transcriber_worker.stats_updated.connect(self._on_stats_updated)
+            self.transcriber_worker.performance_alert.connect(self._on_performance_alert)
             self.transcriber_worker.start()
 
             if language not in ["en", "auto"]:
@@ -608,11 +791,13 @@ class MeetingTranscriberWindow(QMainWindow):
                 self.llm_worker.new_analysis.connect(self._on_new_analysis)
                 self.llm_worker.error_occurred.connect(self._on_llm_error)
                 self.llm_worker.status_update.connect(self._on_status_update)
+                self.llm_worker.performance_alert.connect(self._on_performance_alert)
                 self.llm_worker.start()
             else:
                 self.llm_worker = None
 
             self._reset_stats()
+            self.health_indicator.reset()
 
             # Update UI state
             self.is_recording = True
@@ -709,10 +894,16 @@ class MeetingTranscriberWindow(QMainWindow):
         self.status_bar.showMessage(f"{prefix}  ({status})")
 
     def _on_audio_error(self, error_msg: str):
+        self.health_indicator.update_component(
+            "audio_queue", HEALTH_CRITICAL, f"Audio error: {error_msg}"
+        )
         QMessageBox.critical(self, "Audio Error", error_msg)
         self._stop_recording()
 
     def _on_transcription_error(self, error_msg: str):
+        self.health_indicator.update_component(
+            "whisper", HEALTH_CRITICAL, f"Transcription error: {error_msg}"
+        )
         QMessageBox.critical(self, "Transcription Error", error_msg)
 
     def _on_translation_error(self, error_msg: str):
@@ -720,8 +911,18 @@ class MeetingTranscriberWindow(QMainWindow):
         self.status_bar.showMessage(f"Translation error: {error_msg}")
 
     def _on_llm_error(self, error_msg: str):
+        self.health_indicator.update_component(
+            "llm", HEALTH_CRITICAL, f"LLM error: {error_msg}"
+        )
         print(f"LLM error: {error_msg}")
         self.status_bar.showMessage(f"LLM error: {error_msg}")
+
+    def _on_performance_alert(self, alert: dict):
+        """Handle performance health updates from worker threads."""
+        component = alert.get("component", "")
+        level = alert.get("level", HEALTH_OK)
+        detail = alert.get("detail", "")
+        self.health_indicator.update_component(component, level, detail)
 
     # ------------------------------------------------------------------
     #  Lifecycle

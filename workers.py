@@ -82,6 +82,22 @@ class AudioWorker(QThread):
         return self.audio_queue
 
 
+# ---------------------------------------------------------------------------
+#  Performance health levels
+# ---------------------------------------------------------------------------
+HEALTH_OK = "ok"
+HEALTH_WARN = "warn"
+HEALTH_CRITICAL = "critical"
+
+# Thresholds (can be tuned or exposed in settings later)
+WHISPER_RTF_WARN = 0.8    # real-time factor above which we warn
+WHISPER_RTF_CRIT = 1.0    # real-time factor above which it's critical
+QUEUE_BACKLOG_WARN = 20   # audio chunks piled up
+QUEUE_BACKLOG_CRIT = 50
+LLM_RESPONSE_WARN_S = 15  # seconds
+LLM_RESPONSE_CRIT_S = 30
+
+
 class TranscriberWorker(QThread):
     """
     Worker thread that transcribes audio using faster-whisper.
@@ -92,6 +108,8 @@ class TranscriberWorker(QThread):
     status_update = Signal(str)
     error_occurred = Signal(str)
     stats_updated = Signal(dict)
+    # Emits dict with component health: {"component": str, "level": str, "detail": str}
+    performance_alert = Signal(dict)
 
     def __init__(
         self,
@@ -249,6 +267,27 @@ class TranscriberWorker(QThread):
                         t_received = datetime.now()
                         transcribe_ms = (t_end - t_start) * 1000
 
+                        # --- Performance health check: audio queue backlog ---
+                        queue_size = self.audio_queue.qsize()
+                        if queue_size >= QUEUE_BACKLOG_CRIT:
+                            self.performance_alert.emit({
+                                "component": "audio_queue",
+                                "level": HEALTH_CRITICAL,
+                                "detail": f"Audio queue backlog: {queue_size} chunks",
+                            })
+                        elif queue_size >= QUEUE_BACKLOG_WARN:
+                            self.performance_alert.emit({
+                                "component": "audio_queue",
+                                "level": HEALTH_WARN,
+                                "detail": f"Audio queue backlog: {queue_size} chunks",
+                            })
+                        else:
+                            self.performance_alert.emit({
+                                "component": "audio_queue",
+                                "level": HEALTH_OK,
+                                "detail": f"Queue: {queue_size} chunks",
+                            })
+
                         if transcribed_text.strip():
                             # Update rolling context (keep last N words)
                             combined = (self.context_prompt + " " + transcribed_text).split()
@@ -276,6 +315,26 @@ class TranscriberWorker(QThread):
                                     "chunk_count": 1,
                                 }
                             )
+
+                            # --- Performance health check: Whisper RTF ---
+                            if rtf >= WHISPER_RTF_CRIT:
+                                self.performance_alert.emit({
+                                    "component": "whisper",
+                                    "level": HEALTH_CRITICAL,
+                                    "detail": f"Whisper RTF {rtf:.2f} (>{WHISPER_RTF_CRIT}) — too slow, consider a smaller model",
+                                })
+                            elif rtf >= WHISPER_RTF_WARN:
+                                self.performance_alert.emit({
+                                    "component": "whisper",
+                                    "level": HEALTH_WARN,
+                                    "detail": f"Whisper RTF {rtf:.2f} — approaching real-time limit",
+                                })
+                            else:
+                                self.performance_alert.emit({
+                                    "component": "whisper",
+                                    "level": HEALTH_OK,
+                                    "detail": f"Whisper RTF {rtf:.2f}",
+                                })
 
                 except Exception as e:
                     error_msg = f"Transcription error: {str(e)}"
@@ -480,6 +539,8 @@ class LLMAnalysisWorker(QThread):
     new_analysis = Signal(str)       # full analysis text (replaces previous)
     error_occurred = Signal(str)
     status_update = Signal(str)
+    # Emits dict with component health: {"component": str, "level": str, "detail": str}
+    performance_alert = Signal(dict)
 
     def __init__(self, interval_s: int = 30, window_minutes: int = 15):
         """
@@ -563,6 +624,7 @@ class LLMAnalysisWorker(QThread):
 
             try:
                 self.status_update.emit("Analyzing meeting…")
+                llm_t0 = time.perf_counter()
                 response = self.client.chat.completions.create(
                     model="deepseek-chat",
                     messages=[
@@ -572,13 +634,39 @@ class LLMAnalysisWorker(QThread):
                     temperature=0.3,
                     max_tokens=1024,
                 )
+                llm_elapsed_s = time.perf_counter() - llm_t0
                 analysis = response.choices[0].message.content.strip()
                 self._previous_analysis = analysis
                 self.new_analysis.emit(analysis)
-                self.status_update.emit("LLM analysis updated")
+                self.status_update.emit(f"LLM analysis updated ({llm_elapsed_s:.1f}s)")
+
+                # --- Performance health check: LLM response time ---
+                if llm_elapsed_s >= LLM_RESPONSE_CRIT_S:
+                    self.performance_alert.emit({
+                        "component": "llm",
+                        "level": HEALTH_CRITICAL,
+                        "detail": f"LLM response took {llm_elapsed_s:.1f}s (>{LLM_RESPONSE_CRIT_S}s)",
+                    })
+                elif llm_elapsed_s >= LLM_RESPONSE_WARN_S:
+                    self.performance_alert.emit({
+                        "component": "llm",
+                        "level": HEALTH_WARN,
+                        "detail": f"LLM response took {llm_elapsed_s:.1f}s",
+                    })
+                else:
+                    self.performance_alert.emit({
+                        "component": "llm",
+                        "level": HEALTH_OK,
+                        "detail": f"LLM response {llm_elapsed_s:.1f}s",
+                    })
             except Exception as e:
                 error_msg = f"LLM analysis error: {e}"
                 self.error_occurred.emit(error_msg)
+                self.performance_alert.emit({
+                    "component": "llm",
+                    "level": HEALTH_CRITICAL,
+                    "detail": f"LLM error: {e}",
+                })
                 print(error_msg)
 
     def stop(self):
