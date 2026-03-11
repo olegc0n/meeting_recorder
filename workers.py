@@ -66,11 +66,10 @@ class AudioWorker(QThread):
     Worker thread that captures audio from a loopback device.
 
     Accumulates raw samples until a silence boundary is detected (or the
-    maximum chunk duration is reached), then prepends an overlap window from
-    the previous chunk and pushes a ready-to-transcribe tuple
-    ``(audio: np.ndarray, overlap_s: float, chunk_start: datetime)``
-    to the queue.  TranscriberWorker can therefore skip all buffer management
-    and silence detection.
+    maximum chunk duration is reached), then pushes a ready-to-transcribe
+    tuple ``(audio: np.ndarray, chunk_start: datetime)`` to the queue.
+    TranscriberWorker can therefore skip all buffer management and silence
+    detection.
     """
 
     error_occurred = Signal(str)
@@ -83,7 +82,6 @@ class AudioWorker(QThread):
         min_duration_s: float = 7.0,
         silence_threshold: float = 0.02,
         silence_frames_s: float = 0.65,
-        overlap_s: float = 1.0,
         max_duration_s: float = 30.0,
     ):
         """
@@ -97,10 +95,6 @@ class AudioWorker(QThread):
                 considered silent.
             silence_frames_s: Length (seconds) of the tail window used for the
                 silence check.
-            overlap_s: Minimum seconds from the end that the overlap must cover.
-                The actual cut point is walked backward from that position until
-                a silent window is found, so the overlap always starts at a
-                natural speech boundary.
             max_duration_s: Hard upper limit on chunk duration; forces a flush
                 even if no silence is detected.
         """
@@ -111,7 +105,6 @@ class AudioWorker(QThread):
         self.min_duration_s = min_duration_s
         self.silence_threshold = silence_threshold
         self.silence_frames_s = silence_frames_s
-        self.overlap_s = overlap_s
         self.max_duration_s = max_duration_s
         self.audio_queue = Queue()
         self.running = False
@@ -168,40 +161,29 @@ class AudioWorker(QThread):
 
         return last_valid_start
 
-    def _save_debug_chunk(self, full_chunk: np.ndarray, overlap: np.ndarray, new_audio: np.ndarray) -> None:
-        """Save three WAV files per chunk for debugging:
-        - chunk_NNN_full.wav    — what Whisper receives (overlap + new audio)
-        - chunk_NNN_overlap.wav — the overlap piece prepended from the previous chunk
-        - chunk_NNN_new.wav     — the freshly recorded audio (no overlap)
+    def _save_debug_chunk(self, audio: np.ndarray) -> None:
+        """Save a WAV file per chunk for debugging:
+        - chunk_NNN.wav — the audio sent to Whisper
         """
         debug_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "debug_chunks")
         os.makedirs(debug_dir, exist_ok=True)
         self._debug_chunk_index += 1
         idx = self._debug_chunk_index
 
-        def _write_wav(path: str, audio: np.ndarray) -> None:
-            pcm = np.clip(audio, -1.0, 1.0)
-            pcm_int16 = (pcm * 32767).astype(np.int16)
-            with wave.open(path, "wb") as wf:
-                wf.setnchannels(1)
-                wf.setsampwidth(2)
-                wf.setframerate(self.sample_rate)
-                wf.writeframes(pcm_int16.tobytes())
-
-        parts = {
-            "full":    full_chunk,
-            "overlap": overlap,
-            "new":     new_audio,
-        }
-        for label, audio in parts.items():
-            if len(audio) == 0:
-                continue
-            path = os.path.join(debug_dir, f"chunk_{idx:03d}_{label}.wav")
-            _write_wav(path, audio)
-            _log.debug(
-                "DEBUG_SAVE_CHUNKS  saved %s  duration=%.2fs",
-                path, len(audio) / self.sample_rate,
-            )
+        if len(audio) == 0:
+            return
+        pcm = np.clip(audio, -1.0, 1.0)
+        pcm_int16 = (pcm * 32767).astype(np.int16)
+        path = os.path.join(debug_dir, f"chunk_{idx:03d}.wav")
+        with wave.open(path, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(self.sample_rate)
+            wf.writeframes(pcm_int16.tobytes())
+        _log.debug(
+            "DEBUG_SAVE_CHUNKS  saved %s  duration=%.2fs",
+            path, len(audio) / self.sample_rate,
+        )
 
     def run(self):
         """Main recording loop."""
@@ -210,18 +192,16 @@ class AudioWorker(QThread):
             self.running = True
             _log.info(
                 "AudioWorker started  device_id=%s  sample_rate=%d  chunk_size=%d  "
-                "min_duration=%.1fs  silence_threshold=%.4f  overlap=%.1fs  max_duration=%.1fs",
+                "min_duration=%.1fs  silence_threshold=%.4f  max_duration=%.1fs",
                 self.device_id, self.sample_rate, self.chunk_size,
-                self.min_duration_s, self.silence_threshold, self.overlap_s, self.max_duration_s,
+                self.min_duration_s, self.silence_threshold, self.max_duration_s,
             )
 
             audio_buffer = np.array([], dtype=np.float32)
-            prev_overlap = np.array([], dtype=np.float32)
             chunk_start_time: Optional[datetime] = None
 
             min_samples = int(self.sample_rate * self.min_duration_s)
             silence_samples = int(self.sample_rate * self.silence_frames_s)
-            overlap_samples = int(self.sample_rate * self.overlap_s)
             max_samples = int(self.sample_rate * self.max_duration_s)
 
             with self.microphone.recorder(samplerate=self.sample_rate) as mic:
@@ -252,47 +232,18 @@ class AudioWorker(QThread):
 
                     if buffer_full or silence_triggered:
                         trigger = "buffer_full" if buffer_full else "silence"
-                        actual_overlap_s = len(prev_overlap) / self.sample_rate
-
-                        # Prepend overlap from the previous chunk for Whisper context
-                        full_chunk = (
-                            np.concatenate([prev_overlap, audio_buffer])
-                            if len(prev_overlap) > 0
-                            else audio_buffer.copy()
-                        )
 
                         _log.info(
-                            "AudioWorker chunk ready  trigger=%s  buffer=%.2fs  overlap=%.2fs",
+                            "AudioWorker chunk ready  trigger=%s  buffer=%.2fs",
                             trigger,
                             len(audio_buffer) / self.sample_rate,
-                            actual_overlap_s,
                         )
-
-                        # Determine overlap for the next chunk: search for a silence
-                        # boundary in a limited window just *before* the 1s mark.
-                        # Max look-back is 4 s so the overlap stays bounded.
-                        buf_len = len(audio_buffer)
-                        fallback_start = max(0, buf_len - overlap_samples)
-                        lookback_start = max(0, fallback_start - int(self.sample_rate * 4.0))
-                        silence_pos = self._find_silence(
-                            audio_buffer, lookback_start, fallback_start
-                        )
-                        if silence_pos is not None:
-                            overlap_start = silence_pos
-                            _log.debug(
-                                "AudioWorker overlap cut at silence  pos=%.2fs  from_end=%.2fs",
-                                silence_pos / self.sample_rate,
-                                (buf_len - silence_pos) / self.sample_rate,
-                            )
-                        else:
-                            overlap_start = fallback_start
-                        prev_overlap = audio_buffer[overlap_start:].copy()
 
                         if DEBUG_SAVE_CHUNKS:
-                            self._save_debug_chunk(full_chunk, prev_overlap, audio_buffer)
+                            self._save_debug_chunk(audio_buffer)
 
                         if self.running:
-                            self.audio_queue.put((full_chunk, actual_overlap_s, chunk_start_time))
+                            self.audio_queue.put((audio_buffer.copy(), chunk_start_time))
 
                         audio_buffer = np.array([], dtype=np.float32)
                         chunk_start_time = None
@@ -375,49 +326,6 @@ class TranscriberWorker(QThread):
         self.context_prompt: str = ""
         self._max_prompt_words: int = 30
 
-    @staticmethod
-    def _normalize_word(w: str) -> str:
-        """Lowercase and strip punctuation for fuzzy word comparison."""
-        return "".join(c for c in w.lower() if c.isalnum())
-
-    def _strip_overlap_prefix(self, text: str) -> str:
-        """
-        Remove words from the START of *text* that duplicate the TAIL of
-        self.context_prompt.
-
-        Whisper sometimes re-transcribes the last word(s) of the overlap even
-        after the timestamp filter, because a segment straddles the boundary.
-        This catches that case at the word level using punctuation-insensitive
-        comparison.
-        """
-        if not self.context_prompt or not text:
-            return text
-
-        ctx_words = self.context_prompt.split()
-        txt_words = text.split()
-        if not ctx_words or not txt_words:
-            return text
-
-        # Cap search to avoid false positives on common short words
-        max_check = min(len(ctx_words), len(txt_words), 15)
-
-        for length in range(max_check, 0, -1):
-            ctx_tail = [self._normalize_word(w) for w in ctx_words[-length:]]
-            txt_head = [self._normalize_word(w) for w in txt_words[:length]]
-            # Ignore empty tokens (pure-punctuation words normalize to "")
-            if any(t == "" for t in ctx_tail + txt_head):
-                continue
-            if ctx_tail == txt_head:
-                removed = " ".join(txt_words[:length])
-                result = " ".join(txt_words[length:]).strip()
-                _log.info(
-                    "Dedup stripped %d word(s) from transcription start: %r",
-                    length, removed,
-                )
-                return result
-
-        return text
-
     def run(self):
         """Main transcription loop."""
         try:
@@ -459,7 +367,7 @@ class TranscriberWorker(QThread):
                 try:
                     try:
                         item = self.audio_queue.get(timeout=0.1)
-                        audio_to_transcribe, overlap_s, chunk_start_time = item
+                        audio_to_transcribe, chunk_start_time = item
                     except Empty:
                         continue
 
@@ -468,7 +376,7 @@ class TranscriberWorker(QThread):
                     initial_prompt=(self.context_prompt or None) if self.use_initial_prompt else None
 
                     _log.info(
-                        f"Transcribing  audio_duration={audio_duration_s:.2f}s  overlap={overlap_s:.2f}s  initial_prompt={initial_prompt}  queue_backlog={self.audio_queue.qsize()}",
+                        f"Transcribing  audio_duration={audio_duration_s:.2f}s  initial_prompt={initial_prompt}  queue_backlog={self.audio_queue.qsize()}",
                     )
 
                     t_start = time.perf_counter()
@@ -485,18 +393,9 @@ class TranscriberWorker(QThread):
                     # Iterate the generator — actual decoding happens here
                     transcribed_text = ""
                     for segment in segments:
-                        # Skip segments that lie ENTIRELY within the overlap
-                        # window prepended by AudioWorker — they were already
-                        # emitted as part of the previous chunk.
-                        if segment.end <= overlap_s:
-                            continue
                         transcribed_text += segment.text.strip() + " "
 
-                    # A segment that straddles the overlap boundary is kept in
-                    # full (its start < overlap_s but end > overlap_s), so its
-                    # first words may duplicate the tail of context_prompt.
-                    # Strip any such prefix now.
-                    transcribed_text = self._strip_overlap_prefix(transcribed_text.strip())
+                    transcribed_text = transcribed_text.strip()
 
                     t_end = time.perf_counter()
                     t_received = datetime.now()
