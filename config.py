@@ -19,7 +19,7 @@ def default_transcription_config() -> dict:
         "device": "cpu",
         "compute_type": "int8",
         "beam_size": 5,
-        "buffer_duration": 3.0,
+        "buffer_duration": 7.0,
         "vad_filter": True,
         "use_initial_prompt": True,
         "llm_analysis_enabled": True,

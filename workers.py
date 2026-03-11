@@ -7,7 +7,15 @@ import time
 import threading
 import logging
 import logging.handlers
+import wave
 from datetime import datetime, timedelta
+
+# ---------------------------------------------------------------------------
+#  Debug flag — set to True to save every audio chunk as a WAV file so you
+#  can play them back and verify what is being recorded.  Files are written
+#  to  debug_chunks/  next to this script, named chunk_001.wav, chunk_002.wav …
+# ---------------------------------------------------------------------------
+DEBUG_SAVE_CHUNKS: bool = True
 import soundcard as sc
 import numpy as np
 from queue import Queue, Empty
@@ -56,53 +64,238 @@ if not _log.handlers:
 class AudioWorker(QThread):
     """
     Worker thread that captures audio from a loopback device.
-    Pushes raw audio chunks to a queue for processing.
+
+    Accumulates raw samples until a silence boundary is detected (or the
+    maximum chunk duration is reached), then prepends an overlap window from
+    the previous chunk and pushes a ready-to-transcribe tuple
+    ``(audio: np.ndarray, overlap_s: float, chunk_start: datetime)``
+    to the queue.  TranscriberWorker can therefore skip all buffer management
+    and silence detection.
     """
 
     error_occurred = Signal(str)
 
-    def __init__(self, device_id: str, sample_rate: int = 16000, chunk_size: int = 1024):
+    def __init__(
+        self,
+        device_id: str,
+        sample_rate: int = 16000,
+        chunk_size: int = 1024,
+        min_duration_s: float = 7.0,
+        silence_threshold: float = 0.02,
+        silence_frames_s: float = 0.65,
+        overlap_s: float = 1.0,
+        max_duration_s: float = 30.0,
+    ):
         """
-        Initialize the audio worker.
-
         Args:
-            device_id: The ID of the loopback microphone device
-            sample_rate: Audio sample rate (default 16000 for Whisper)
-            chunk_size: Number of samples per chunk
+            device_id: Loopback microphone device ID.
+            sample_rate: Audio sample rate (should match Whisper's expectation: 16 000 Hz).
+            chunk_size: Raw frames read per mic.record() call.
+            min_duration_s: Minimum seconds of audio to accumulate before a
+                silence trigger is allowed.
+            silence_threshold: RMS energy below which a tail window is
+                considered silent.
+            silence_frames_s: Length (seconds) of the tail window used for the
+                silence check.
+            overlap_s: Minimum seconds from the end that the overlap must cover.
+                The actual cut point is walked backward from that position until
+                a silent window is found, so the overlap always starts at a
+                natural speech boundary.
+            max_duration_s: Hard upper limit on chunk duration; forces a flush
+                even if no silence is detected.
         """
         super().__init__()
         self.device_id = device_id
         self.sample_rate = sample_rate
         self.chunk_size = chunk_size
+        self.min_duration_s = min_duration_s
+        self.silence_threshold = silence_threshold
+        self.silence_frames_s = silence_frames_s
+        self.overlap_s = overlap_s
+        self.max_duration_s = max_duration_s
         self.audio_queue = Queue()
         self.running = False
         self.microphone = None
+        self._debug_chunk_index: int = 0
+
+    def _find_silence(
+        self,
+        audio: np.ndarray,
+        search_start: int,
+        search_end: int,
+        frame_ms: int = 30,
+        min_silent_frames: int = 3,
+    ) -> Optional[int]:
+        """
+        Scan audio[search_start:search_end] in fixed-size frames and return the
+        sample index at the START of the most recent (closest to search_end)
+        run of at least *min_silent_frames* consecutive silent frames.
+
+        A frame is silent when its RMS is below self.silence_threshold.
+        Returns None if no qualifying run is found.
+
+        Using per-frame analysis (30 ms each) is far more robust than a single
+        RMS over a long window: one loud transient no longer masks silence.
+        Requiring consecutive silent frames avoids false triggers on brief gaps.
+        """
+        frame_size = int(self.sample_rate * frame_ms / 1000)
+        if frame_size == 0 or search_end - search_start < frame_size:
+            return None
+
+        # Compute RMS for every full frame in the range
+        frames: list[tuple[int, bool]] = []
+        pos = search_start
+        while pos + frame_size <= search_end:
+            rms = float(np.sqrt(np.mean(audio[pos : pos + frame_size] ** 2)))
+            frames.append((pos, rms < self.silence_threshold))
+            pos += frame_size
+
+        # Walk forward keeping track of the most recent qualifying silent run
+        last_valid_start: Optional[int] = None
+        run_start: Optional[int] = None
+        run_len = 0
+
+        for frame_pos, is_silent in frames:
+            if is_silent:
+                if run_start is None:
+                    run_start = frame_pos
+                run_len += 1
+                if run_len >= min_silent_frames:
+                    last_valid_start = run_start
+            else:
+                run_start = None
+                run_len = 0
+
+        return last_valid_start
+
+    def _save_debug_chunk(self, full_chunk: np.ndarray, overlap: np.ndarray, new_audio: np.ndarray) -> None:
+        """Save three WAV files per chunk for debugging:
+        - chunk_NNN_full.wav    — what Whisper receives (overlap + new audio)
+        - chunk_NNN_overlap.wav — the overlap piece prepended from the previous chunk
+        - chunk_NNN_new.wav     — the freshly recorded audio (no overlap)
+        """
+        debug_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "debug_chunks")
+        os.makedirs(debug_dir, exist_ok=True)
+        self._debug_chunk_index += 1
+        idx = self._debug_chunk_index
+
+        def _write_wav(path: str, audio: np.ndarray) -> None:
+            pcm = np.clip(audio, -1.0, 1.0)
+            pcm_int16 = (pcm * 32767).astype(np.int16)
+            with wave.open(path, "wb") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(self.sample_rate)
+                wf.writeframes(pcm_int16.tobytes())
+
+        parts = {
+            "full":    full_chunk,
+            "overlap": overlap,
+            "new":     new_audio,
+        }
+        for label, audio in parts.items():
+            if len(audio) == 0:
+                continue
+            path = os.path.join(debug_dir, f"chunk_{idx:03d}_{label}.wav")
+            _write_wav(path, audio)
+            _log.debug(
+                "DEBUG_SAVE_CHUNKS  saved %s  duration=%.2fs",
+                path, len(audio) / self.sample_rate,
+            )
 
     def run(self):
         """Main recording loop."""
         try:
-            # Open loopback device (API exposes it as a "microphone" that captures speaker output)
             self.microphone = sc.get_microphone(self.device_id, include_loopback=True)
             self.running = True
-            _log.info("AudioWorker started  device_id=%s  sample_rate=%d  chunk_size=%d",
-                      self.device_id, self.sample_rate, self.chunk_size)
+            _log.info(
+                "AudioWorker started  device_id=%s  sample_rate=%d  chunk_size=%d  "
+                "min_duration=%.1fs  silence_threshold=%.4f  overlap=%.1fs  max_duration=%.1fs",
+                self.device_id, self.sample_rate, self.chunk_size,
+                self.min_duration_s, self.silence_threshold, self.overlap_s, self.max_duration_s,
+            )
 
-            # Record audio in chunks
+            audio_buffer = np.array([], dtype=np.float32)
+            prev_overlap = np.array([], dtype=np.float32)
+            chunk_start_time: Optional[datetime] = None
+
+            min_samples = int(self.sample_rate * self.min_duration_s)
+            silence_samples = int(self.sample_rate * self.silence_frames_s)
+            overlap_samples = int(self.sample_rate * self.overlap_s)
+            max_samples = int(self.sample_rate * self.max_duration_s)
+
             with self.microphone.recorder(samplerate=self.sample_rate) as mic:
                 while self.running:
-                    # Read audio chunk
                     audio_data = mic.record(numframes=self.chunk_size)
 
-                    # Convert to mono if stereo (take mean of channels)
                     if len(audio_data.shape) > 1:
                         audio_data = np.mean(audio_data, axis=1)
-
-                    # Ensure float32 format
                     audio_data = audio_data.astype(np.float32)
 
-                    # Push to queue
-                    if self.running:
-                        self.audio_queue.put(audio_data)
+                    if chunk_start_time is None:
+                        chunk_start_time = datetime.now()
+                    audio_buffer = np.concatenate([audio_buffer, audio_data])
+
+                    # --- Decide whether to flush ---
+                    buffer_full = len(audio_buffer) >= max_samples
+
+                    silence_triggered = False
+                    if not buffer_full and len(audio_buffer) >= min_samples:
+                        # Check the last silence_frames_s of audio using frame-level
+                        # analysis.  A single-RMS check on the whole tail is fooled by
+                        # one loud sample; per-frame consecutive detection is robust.
+                        tail_end = len(audio_buffer)
+                        tail_start = max(0, tail_end - silence_samples)
+                        silence_triggered = (
+                            self._find_silence(audio_buffer, tail_start, tail_end) is not None
+                        )
+
+                    if buffer_full or silence_triggered:
+                        trigger = "buffer_full" if buffer_full else "silence"
+                        actual_overlap_s = len(prev_overlap) / self.sample_rate
+
+                        # Prepend overlap from the previous chunk for Whisper context
+                        full_chunk = (
+                            np.concatenate([prev_overlap, audio_buffer])
+                            if len(prev_overlap) > 0
+                            else audio_buffer.copy()
+                        )
+
+                        _log.info(
+                            "AudioWorker chunk ready  trigger=%s  buffer=%.2fs  overlap=%.2fs",
+                            trigger,
+                            len(audio_buffer) / self.sample_rate,
+                            actual_overlap_s,
+                        )
+
+                        # Determine overlap for the next chunk: search for a silence
+                        # boundary in a limited window just *before* the 1s mark.
+                        # Max look-back is 4 s so the overlap stays bounded.
+                        buf_len = len(audio_buffer)
+                        fallback_start = max(0, buf_len - overlap_samples)
+                        lookback_start = max(0, fallback_start - int(self.sample_rate * 4.0))
+                        silence_pos = self._find_silence(
+                            audio_buffer, lookback_start, fallback_start
+                        )
+                        if silence_pos is not None:
+                            overlap_start = silence_pos
+                            _log.debug(
+                                "AudioWorker overlap cut at silence  pos=%.2fs  from_end=%.2fs",
+                                silence_pos / self.sample_rate,
+                                (buf_len - silence_pos) / self.sample_rate,
+                            )
+                        else:
+                            overlap_start = fallback_start
+                        prev_overlap = audio_buffer[overlap_start:].copy()
+
+                        if DEBUG_SAVE_CHUNKS:
+                            self._save_debug_chunk(full_chunk, prev_overlap, audio_buffer)
+
+                        if self.running:
+                            self.audio_queue.put((full_chunk, actual_overlap_s, chunk_start_time))
+
+                        audio_buffer = np.array([], dtype=np.float32)
+                        chunk_start_time = None
 
         except Exception as e:
             error_msg = f"Audio capture error: {str(e)}"
@@ -161,7 +354,6 @@ class TranscriberWorker(QThread):
         device: str = "cpu",
         compute_type: str = "int8",
         beam_size: int = 5,
-        buffer_duration: float = 3.0,
         vad_filter: bool = True,
         use_initial_prompt: bool = True,
     ):
@@ -172,33 +364,59 @@ class TranscriberWorker(QThread):
         self.device = device
         self.compute_type = compute_type
         self.beam_size = beam_size
-        self.buffer_duration = buffer_duration
         self.vad_filter = vad_filter
         self.use_initial_prompt = use_initial_prompt
         self.model: Optional[WhisperModel] = None
         self.running = False
 
         self.sample_rate = 16000
-        self.buffer_samples = int(self.sample_rate * buffer_duration)
-        self.audio_buffer = np.array([], dtype=np.float32)
 
         # Rolling context fed back to Whisper as initial_prompt for better continuity
         self.context_prompt: str = ""
         self._max_prompt_words: int = 30
 
-        # Seconds of audio that were kept as overlap from the previous chunk.
-        # Segments whose end timestamp falls within this window are already
-        # transcribed and must be skipped.
-        self._overlap_s: float = 0.0
+    @staticmethod
+    def _normalize_word(w: str) -> str:
+        """Lowercase and strip punctuation for fuzzy word comparison."""
+        return "".join(c for c in w.lower() if c.isalnum())
 
-        # Wall-clock time when the current audio chunk started accumulating
-        self._chunk_start_time: Optional[datetime] = None
+    def _strip_overlap_prefix(self, text: str) -> str:
+        """
+        Remove words from the START of *text* that duplicate the TAIL of
+        self.context_prompt.
 
-        # Silence-based early segmentation: trigger transcription when a pause
-        # is detected, rather than always waiting for the full buffer to fill.
-        self.silence_threshold: float = 0.01   # RMS energy below this = silence
-        self.silence_frames_s: float = 0.65    # seconds of silence required
-        self.min_audio_s: float = 1.5          # minimum NEW audio before silence trigger applies
+        Whisper sometimes re-transcribes the last word(s) of the overlap even
+        after the timestamp filter, because a segment straddles the boundary.
+        This catches that case at the word level using punctuation-insensitive
+        comparison.
+        """
+        if not self.context_prompt or not text:
+            return text
+
+        ctx_words = self.context_prompt.split()
+        txt_words = text.split()
+        if not ctx_words or not txt_words:
+            return text
+
+        # Cap search to avoid false positives on common short words
+        max_check = min(len(ctx_words), len(txt_words), 15)
+
+        for length in range(max_check, 0, -1):
+            ctx_tail = [self._normalize_word(w) for w in ctx_words[-length:]]
+            txt_head = [self._normalize_word(w) for w in txt_words[:length]]
+            # Ignore empty tokens (pure-punctuation words normalize to "")
+            if any(t == "" for t in ctx_tail + txt_head):
+                continue
+            if ctx_tail == txt_head:
+                removed = " ".join(txt_words[:length])
+                result = " ".join(txt_words[length:]).strip()
+                _log.info(
+                    "Dedup stripped %d word(s) from transcription start: %r",
+                    length, removed,
+                )
+                return result
+
+        return text
 
     def run(self):
         """Main transcription loop."""
@@ -210,9 +428,9 @@ class TranscriberWorker(QThread):
                 device = "cuda"
             _log.info(
                 "TranscriberWorker loading model  model=%s  device=%s  compute_type=%s  "
-                "beam_size=%d  buffer_duration=%.1fs  vad=%s  initial_prompt=%s",
+                "beam_size=%d  vad=%s  initial_prompt=%s",
                 self.model_size, device, self.compute_type,
-                self.beam_size, self.buffer_duration, self.vad_filter, self.use_initial_prompt,
+                self.beam_size, self.vad_filter, self.use_initial_prompt,
             )
             try:
                 self.model = WhisperModel(
@@ -240,178 +458,132 @@ class TranscriberWorker(QThread):
             while self.running:
                 try:
                     try:
-                        chunk = self.audio_queue.get(timeout=0.1)
-                        if self._chunk_start_time is None:
-                            self._chunk_start_time = datetime.now()
-                        self.audio_buffer = np.concatenate([self.audio_buffer, chunk])
+                        item = self.audio_queue.get(timeout=0.1)
+                        audio_to_transcribe, overlap_s, chunk_start_time = item
                     except Empty:
                         continue
 
-                    # --- Decide whether to transcribe now ---
-                    min_samples = int(self.sample_rate * self.min_audio_s)
-                    silence_samples = int(self.sample_rate * self.silence_frames_s)
+                    chunk_end_time = datetime.now()
+                    audio_duration_s = len(audio_to_transcribe) / self.sample_rate
+                    initial_prompt=(self.context_prompt or None) if self.use_initial_prompt else None
 
-                    buffer_full = len(self.audio_buffer) >= self.buffer_samples
+                    _log.info(
+                        f"Transcribing  audio_duration={audio_duration_s:.2f}s  overlap={overlap_s:.2f}s  initial_prompt={initial_prompt}  queue_backlog={self.audio_queue.qsize()}",
+                    )
 
-                    # Only count *new* audio beyond the kept overlap toward the
-                    # minimum, so the overlap portion alone cannot immediately
-                    # re-trigger a silence-based transcription.
-                    overlap_samples_kept = int(self.sample_rate * self._overlap_s)
-                    new_samples_in_buffer = len(self.audio_buffer) - overlap_samples_kept
+                    t_start = time.perf_counter()
+                    segments, info = self.model.transcribe(
+                        audio_to_transcribe,
+                        language=self.language,
+                        beam_size=self.beam_size,
+                        vad_filter=self.vad_filter,
+                        # Provide previous transcript as context so Whisper
+                        # can carry over vocabulary, style and proper nouns.
+                        initial_prompt=initial_prompt,
+                    )
 
-                    silence_triggered = False
-                    if not buffer_full and new_samples_in_buffer >= min_samples:
-                        tail = (
-                            self.audio_buffer[-silence_samples:]
-                            if len(self.audio_buffer) >= silence_samples
-                            else self.audio_buffer
-                        )
-                        rms = float(np.sqrt(np.mean(tail ** 2)))
-                        silence_triggered = rms < self.silence_threshold
+                    # Iterate the generator — actual decoding happens here
+                    transcribed_text = ""
+                    for segment in segments:
+                        # Skip segments that lie ENTIRELY within the overlap
+                        # window prepended by AudioWorker — they were already
+                        # emitted as part of the previous chunk.
+                        if segment.end <= overlap_s:
+                            continue
+                        transcribed_text += segment.text.strip() + " "
 
-                    if buffer_full or silence_triggered:
-                        trigger = "buffer_full" if buffer_full else "silence"
-                        audio_to_transcribe = self.audio_buffer.copy()
-                        chunk_start_time = self._chunk_start_time
-                        chunk_end_time = datetime.now()
+                    # A segment that straddles the overlap boundary is kept in
+                    # full (its start < overlap_s but end > overlap_s), so its
+                    # first words may duplicate the tail of context_prompt.
+                    # Strip any such prefix now.
+                    transcribed_text = self._strip_overlap_prefix(transcribed_text.strip())
 
-                        if buffer_full:
-                            # Keep a 1.0s overlap so boundary phrases aren't re-emitted
-                            overlap_samples = int(self.sample_rate * 1.0)
-                            self._overlap_s = overlap_samples / self.sample_rate
-                            self.audio_buffer = self.audio_buffer[-overlap_samples:]
-                            # Overlap carries over into next chunk — record its start now
-                            self._chunk_start_time = datetime.now()
-                        else:
-                            # Clean silence boundary — no overlap needed
-                            self._overlap_s = 0.0
-                            self.audio_buffer = np.array([], dtype=np.float32)
-                            self._chunk_start_time = None
+                    t_end = time.perf_counter()
+                    t_received = datetime.now()
+                    transcribe_ms = (t_end - t_start) * 1000
 
-                        audio_duration_s = len(audio_to_transcribe) / self.sample_rate
+                    # --- Performance health check: audio queue backlog ---
+                    queue_size = self.audio_queue.qsize()
+                    if queue_size >= QUEUE_BACKLOG_CRIT:
+                        self.performance_alert.emit({
+                            "component": "audio_queue",
+                            "level": HEALTH_CRITICAL,
+                            "detail": f"Audio queue backlog: {queue_size} chunks",
+                        })
+                    elif queue_size >= QUEUE_BACKLOG_WARN:
+                        self.performance_alert.emit({
+                            "component": "audio_queue",
+                            "level": HEALTH_WARN,
+                            "detail": f"Audio queue backlog: {queue_size} chunks",
+                        })
+                    else:
+                        self.performance_alert.emit({
+                            "component": "audio_queue",
+                            "level": HEALTH_OK,
+                            "detail": f"Queue: {queue_size} chunks",
+                        })
 
+                    if transcribed_text.strip():
                         _log.info(
-                            "Transcribing  trigger=%s  audio_duration=%.2fs  "
-                            "overlap=%.2fs  queue_backlog=%d",
-                            trigger,
-                            audio_duration_s,
-                            self._overlap_s,
-                            self.audio_queue.qsize(),
+                            "Transcription result  words=%d  rtf=%.3f  latency=%.0fms  "
+                            "text=%r",
+                            len(transcribed_text.split()),
+                            transcribe_ms / 1000 / audio_duration_s if audio_duration_s > 0 else 0,
+                            transcribe_ms,
+                            transcribed_text.strip()[:120],
+                        )
+                        # Update rolling context (keep last N words)
+                        combined = transcribed_text.split()
+                        self.context_prompt = " ".join(combined[-self._max_prompt_words:])
+
+                        self.new_text.emit(
+                            transcribed_text.strip(),
+                            chunk_start_time.strftime("%H:%M:%S.%f")[:-3] if chunk_start_time else "",
+                            chunk_end_time.strftime("%H:%M:%S.%f")[:-3],
+                            t_received.strftime("%H:%M:%S.%f")[:-3],
                         )
 
-                        t_sent = datetime.now()
-                        t_start = time.perf_counter()
-                        segments, info = self.model.transcribe(
-                            audio_to_transcribe,
-                            language=self.language,
-                            beam_size=self.beam_size,
-                            vad_filter=self.vad_filter,
-                            # Provide previous transcript as context so Whisper
-                            # can carry over vocabulary, style and proper nouns.
-                            initial_prompt=(self.context_prompt or None) if self.use_initial_prompt else None,
+                        word_count = len(transcribed_text.split())
+                        rtf = transcribe_ms / 1000 / audio_duration_s if audio_duration_s > 0 else 0
+                        wps = word_count / (transcribe_ms / 1000) if transcribe_ms > 0 else 0
+
+                        self.stats_updated.emit(
+                            {
+                                "rtf": rtf,
+                                "wps": wps,
+                                "latency_ms": transcribe_ms,
+                                "audio_s": audio_duration_s,
+                                "words": word_count,
+                                "model_load_ms": model_load_ms,
+                                "chunk_count": 1,
+                            }
                         )
 
-                        # Iterate the generator — actual decoding happens here
-                        transcribed_text = ""
-                        for segment in segments:
-                            # Skip segments that lie ENTIRELY within the overlap
-                            # window — they were already emitted in the previous
-                            # chunk.  Segments that CROSS the boundary (end >
-                            # overlap_s) are kept in full: with initial_prompt
-                            # context Whisper won't repeat the already-said part,
-                            # and trimming them was causing the first word of new
-                            # speech to be lost.
-                            if segment.end <= self._overlap_s:
-                                continue
-                            transcribed_text += segment.text.strip() + " "
-
-                        t_end = time.perf_counter()
-                        t_received = datetime.now()
-                        transcribe_ms = (t_end - t_start) * 1000
-
-                        # --- Performance health check: audio queue backlog ---
-                        queue_size = self.audio_queue.qsize()
-                        if queue_size >= QUEUE_BACKLOG_CRIT:
+                        # --- Performance health check: Whisper RTF ---
+                        if rtf >= WHISPER_RTF_CRIT:
                             self.performance_alert.emit({
-                                "component": "audio_queue",
+                                "component": "whisper",
                                 "level": HEALTH_CRITICAL,
-                                "detail": f"Audio queue backlog: {queue_size} chunks",
+                                "detail": f"Whisper RTF {rtf:.2f} (>{WHISPER_RTF_CRIT}) — too slow, consider a smaller model",
                             })
-                        elif queue_size >= QUEUE_BACKLOG_WARN:
+                        elif rtf >= WHISPER_RTF_WARN:
                             self.performance_alert.emit({
-                                "component": "audio_queue",
+                                "component": "whisper",
                                 "level": HEALTH_WARN,
-                                "detail": f"Audio queue backlog: {queue_size} chunks",
+                                "detail": f"Whisper RTF {rtf:.2f} — approaching real-time limit",
                             })
                         else:
                             self.performance_alert.emit({
-                                "component": "audio_queue",
+                                "component": "whisper",
                                 "level": HEALTH_OK,
-                                "detail": f"Queue: {queue_size} chunks",
+                                "detail": f"Whisper RTF {rtf:.2f}",
                             })
 
-                        if transcribed_text.strip():
-                            _log.info(
-                                "Transcription result  words=%d  rtf=%.3f  latency=%.0fms  "
-                                "text=%r",
-                                len(transcribed_text.split()),
-                                transcribe_ms / 1000 / audio_duration_s if audio_duration_s > 0 else 0,
-                                transcribe_ms,
-                                transcribed_text.strip()[:120],
-                            )
-                            # Update rolling context (keep last N words)
-                            combined = (self.context_prompt + " " + transcribed_text).split()
-                            self.context_prompt = " ".join(combined[-self._max_prompt_words:])
-
-                            self.new_text.emit(
-                                transcribed_text.strip(),
-                                chunk_start_time.strftime("%H:%M:%S.%f")[:-3] if chunk_start_time else "",
-                                chunk_end_time.strftime("%H:%M:%S.%f")[:-3],
-                                t_received.strftime("%H:%M:%S.%f")[:-3],
-                            )
-
-                            word_count = len(transcribed_text.split())
-                            rtf = transcribe_ms / 1000 / audio_duration_s if audio_duration_s > 0 else 0
-                            wps = word_count / (transcribe_ms / 1000) if transcribe_ms > 0 else 0
-
-                            self.stats_updated.emit(
-                                {
-                                    "rtf": rtf,
-                                    "wps": wps,
-                                    "latency_ms": transcribe_ms,
-                                    "audio_s": audio_duration_s,
-                                    "words": word_count,
-                                    "model_load_ms": model_load_ms,
-                                    "chunk_count": 1,
-                                }
-                            )
-
-                            # --- Performance health check: Whisper RTF ---
-                            if rtf >= WHISPER_RTF_CRIT:
-                                self.performance_alert.emit({
-                                    "component": "whisper",
-                                    "level": HEALTH_CRITICAL,
-                                    "detail": f"Whisper RTF {rtf:.2f} (>{WHISPER_RTF_CRIT}) — too slow, consider a smaller model",
-                                })
-                            elif rtf >= WHISPER_RTF_WARN:
-                                self.performance_alert.emit({
-                                    "component": "whisper",
-                                    "level": HEALTH_WARN,
-                                    "detail": f"Whisper RTF {rtf:.2f} — approaching real-time limit",
-                                })
-                            else:
-                                self.performance_alert.emit({
-                                    "component": "whisper",
-                                    "level": HEALTH_OK,
-                                    "detail": f"Whisper RTF {rtf:.2f}",
-                                })
-
-                        else:
-                            _log.info(
-                                "Transcription empty (no speech detected)  "
-                                "audio_duration=%.2fs  trigger=%s",
-                                audio_duration_s, trigger,
-                            )
+                    else:
+                        _log.info(
+                            "Transcription empty (no speech detected)  audio_duration=%.2fs",
+                            audio_duration_s,
+                        )
 
                 except Exception as e:
                     error_msg = f"Transcription error: {str(e)}"
@@ -430,41 +602,13 @@ class TranscriberWorker(QThread):
         """Stop the transcription loop."""
         _log.info("TranscriberWorker stopping")
         self.running = False
-
-        # Transcribe any remaining audio in buffer
-        if self.model is not None and len(self.audio_buffer) > self.sample_rate:
-            _log.info("TranscriberWorker flushing final buffer  samples=%d", len(self.audio_buffer))
-            try:
-                segments, _ = self.model.transcribe(
-                    self.audio_buffer,
-                    language=self.language,
-                    beam_size=self.beam_size,
-                    vad_filter=self.vad_filter,
-                    initial_prompt=(self.context_prompt or None) if self.use_initial_prompt else None,
-                )
-                transcribed_text = ""
-                for segment in segments:
-                    transcribed_text += segment.text.strip() + " "
-                if transcribed_text.strip():
-                    _log.info("Final buffer text: %r", transcribed_text.strip()[:120])
-                    now = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-                    self.new_text.emit(transcribed_text.strip(), now, now, now)
-            except Exception as e:
-                _log.error("Error transcribing final buffer: %s", e, exc_info=True)
-                print(f"Error transcribing final buffer: {e}")
-
-        self.audio_buffer = np.array([], dtype=np.float32)
         self.context_prompt = ""
-        self._overlap_s = 0.0
-        self._chunk_start_time = None
 
     def set_language(self, language: str):
         """Update the language setting."""
         _log.info("TranscriberWorker language changed to %r", language)
         self.language = language if language != "auto" else None
         self.context_prompt = ""  # reset context when language changes
-        self._overlap_s = 0.0
-        self._chunk_start_time = None
 
 
 class TranslationWorker(QThread):

@@ -777,7 +777,6 @@ class MeetingTranscriberWindow(QMainWindow):
                 device=cfg["device"],
                 compute_type=cfg["compute_type"],
                 beam_size=cfg["beam_size"],
-                buffer_duration=cfg["buffer_duration"],
                 vad_filter=cfg["vad_filter"],
                 use_initial_prompt=cfg["use_initial_prompt"],
             )
