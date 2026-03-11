@@ -53,7 +53,6 @@ if not _log.handlers:
     ))
     _log.addHandler(_app_fh)
 
-
 class AudioWorker(QThread):
     """
     Worker thread that captures audio from a loopback device.
@@ -315,12 +314,14 @@ class TranscriberWorker(QThread):
                         # Iterate the generator — actual decoding happens here
                         transcribed_text = ""
                         for segment in segments:
-                            # Skip segments that START within the overlap window;
-                            # their audio was already transcribed in the previous
-                            # chunk. Using segment.start (not segment.end) avoids
-                            # passing through segments that merely overlap the
-                            # boundary, which caused phrase duplication.
-                            if segment.start < self._overlap_s:
+                            # Skip segments that lie ENTIRELY within the overlap
+                            # window — they were already emitted in the previous
+                            # chunk.  Segments that CROSS the boundary (end >
+                            # overlap_s) are kept in full: with initial_prompt
+                            # context Whisper won't repeat the already-said part,
+                            # and trimming them was causing the first word of new
+                            # speech to be lost.
+                            if segment.end <= self._overlap_s:
                                 continue
                             transcribed_text += segment.text.strip() + " "
 

@@ -14,11 +14,8 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QFormLayout,
     QFrame,
-    QWidget,
-    QGraphicsDropShadowEffect,
 )
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QColor
 
 
 DIALOG_STYLE = """
